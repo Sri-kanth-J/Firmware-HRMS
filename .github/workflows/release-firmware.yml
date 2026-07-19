@@ -43,6 +43,14 @@ jobs:
           arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
+      # arduino-cli disables --git-url/--zip-path installs by default (they
+      # can run arbitrary post-install scripts) -- explicitly opt in since
+      # WiFiManager/FPM/DIYables_TFT_SPI below rely on it.
+      - name: Allow git-based library installs
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config set library.enable_unsafe_install true
+
       # WiFiManager and DIYables_TFT_SPI are pinned to the exact tags this
       # sketch was written and verified against. FPM isn't pinned: its only
       # git tag (v1.0) is older than the "2.0.0" it currently reports on its
