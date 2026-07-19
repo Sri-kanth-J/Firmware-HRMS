@@ -1,0 +1,12 @@
+# Real device OTA token -- never commit. Copy secrets.h.example to secrets.h instead.
+arduinoCode/secrets.h
+
+# Local Arduino IDE / arduino-cli build output
+build/
+*.ino.bin
+*.ino.elf
+*.ino.map
+
+# OS cruft
+.DS_Store
+Thumbs.db

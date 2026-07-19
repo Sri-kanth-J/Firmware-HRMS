@@ -1,0 +1,69 @@
+name: Build and release firmware
+
+# Cut a release by tagging: git tag v1.0.1 && git push origin v1.0.1
+# CI stamps that version into the sketch, compiles it, and publishes it as a
+# GitHub Release with firmware.bin attached -- which is what devices pull
+# down via the "Check Update" menu item.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp FIRMWARE_VERSION to match the tag
+        run: |
+          sed -i "s/#define FIRMWARE_VERSION \".*\"/#define FIRMWARE_VERSION \"${{ steps.version.outputs.version }}\"/" arduinoCode/arduinoCode.ino
+          grep "#define FIRMWARE_VERSION" arduinoCode/arduinoCode.ino
+
+      - name: Write secrets.h (bakes the device OTA token into this build)
+        run: |
+          printf '#pragma once\n#define GITHUB_PAT "%s"\n' "${{ secrets.DEVICE_OTA_PAT }}" > arduinoCode/secrets.h
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "ArduinoJson@6.21.6"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install --git-url https://github.com/tzapu/WiFiManager.git
+          arduino-cli lib install --git-url https://github.com/brianrho/FPM.git
+          arduino-cli lib install --git-url https://github.com/DIYables/DIYables_TFT_SPI.git
+
+      # If your hardware uses a different ESP32 board/variant, change the FQBN
+      # below (and re-check it against your local Arduino IDE board selection).
+      - name: Compile
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32 arduinoCode --output-dir build --warnings default
+
+      - name: Rename binary to the OTA asset name
+        run: cp build/arduinoCode.ino.bin firmware.bin
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" firmware.bin \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
