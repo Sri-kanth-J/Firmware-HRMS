@@ -43,13 +43,18 @@ jobs:
           arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
+      # WiFiManager and DIYables_TFT_SPI are pinned to the exact tags this
+      # sketch was written and verified against. FPM isn't pinned: its only
+      # git tag (v1.0) is older than the "2.0.0" it currently reports on its
+      # default branch, so pinning it would lock to a worse-matched version
+      # than just tracking the branch.
       - name: Install libraries
         run: |
           arduino-cli lib install "ArduinoJson@6.21.6"
           arduino-cli lib install "Adafruit GFX Library"
-          arduino-cli lib install --git-url https://github.com/tzapu/WiFiManager.git
+          arduino-cli lib install --git-url https://github.com/tzapu/WiFiManager.git#v2.0.17
           arduino-cli lib install --git-url https://github.com/brianrho/FPM.git
-          arduino-cli lib install --git-url https://github.com/DIYables/DIYables_TFT_SPI.git
+          arduino-cli lib install --git-url https://github.com/DIYables/DIYables_TFT_SPI.git#v1.0.1
 
       # If your hardware uses a different ESP32 board/variant, change the FQBN
       # below (and re-check it against your local Arduino IDE board selection).
