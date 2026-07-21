@@ -23,14 +23,16 @@
    stripped before comparing) for the device to consider itself up to date.
    To ship an update: bump this, push a tag matching it (e.g. "v1.0.1") to
    OTA_GITHUB_OWNER/OTA_GITHUB_REPO, and CI builds + attaches OTA_ASSET_NAME
-   to the release. Devices only check when "Check Update" is selected from
-   the menu (see checkForOTAUpdate()) -- there's no background polling.
+   to the release. Devices check either when "Check Update" is selected from
+   the menu (see checkForOTAUpdate()), or when the backend queues an
+   "UPDATE" command (see pollForCommands() / performOTAUpdate()) -- there's
+   no periodic background check initiated by the device itself.
 
    NOTE: OTA_GITHUB_REPO is private, so every device carries GITHUB_PAT
    (from secrets.h) to read it. Scope that token to read-only "Contents"
    access on ONLY this repo -- it's baked into every unit's firmware, so a
    dumped/decompiled device exposes it. */
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.0.1"
 #define OTA_GITHUB_OWNER "Sri-kanth-J"
 #define OTA_GITHUB_REPO  "Firmware-HRMS"
 #define OTA_ASSET_NAME   "firmware.bin"
@@ -56,8 +58,8 @@ WiFiClient secureClient;
 #define HTTP_CONNECT_TIMEOUT_MS 8000
 #define HTTP_RESPONSE_TIMEOUT_MS 8000
 
-/* Remote command queue: the backend queues ENROLL/DELETE commands (from the HR/Admin
-   portal) that this device polls for and executes. */
+/* Remote command queue: the backend queues ENROLL/DELETE/UPDATE commands (from the
+   HR/Admin portal) that this device polls for and executes. */
 #define POLL_INTERVAL_MS 20000
 unsigned long lastPollMs = 0;
 
@@ -541,10 +543,19 @@ bool otaDownloadAndFlash(const String &assetApiUrl) {
   return true;
 }
 
-/* "Check Update" menu item: queries the latest release on OTA_GITHUB_REPO,
-   compares its tag to FIRMWARE_VERSION, and if different, downloads +
-   flashes OTA_ASSET_NAME via otaDownloadAndFlash and reboots into it. */
-void checkForOTAUpdate() {
+/* Core of the "Check Update" flow: queries the latest release on
+   OTA_GITHUB_REPO, compares its tag to FIRMWARE_VERSION, and if different,
+   downloads + flashes OTA_ASSET_NAME via otaDownloadAndFlash and reboots
+   into it.
+
+   commandId: pass -1 for a local/manual check (menu item -- no ack sent).
+   Pass a real command ID when triggered remotely via the command queue (see
+   pollForCommands) so the backend gets a DONE/FAILED ack either way -- DONE
+   covers both "updated" and "already up to date", since both mean the
+   command completed successfully. The ack for a successful update is sent
+   just before ESP.restart() -- ackCommand() blocks until the POST completes,
+   so the backend hears back before the reboot happens. */
+void performOTAUpdate(long commandId) {
   showStatus(STATUS_WIFI, "OTA", "Checking...");
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -553,6 +564,7 @@ void checkForOTAUpdate() {
     beepError();
     delay(1200);
     setAuraIdle();
+    if (commandId >= 0) ackCommand(commandId, false, -1);
     return;
   }
 
@@ -579,6 +591,7 @@ void checkForOTAUpdate() {
     beepError();
     delay(1200);
     setAuraIdle();
+    if (commandId >= 0) ackCommand(commandId, false, -1);
     return;
   }
 
@@ -600,6 +613,7 @@ void checkForOTAUpdate() {
     beepError();
     delay(1200);
     setAuraIdle();
+    if (commandId >= 0) ackCommand(commandId, false, -1);
     return;
   }
 
@@ -610,6 +624,7 @@ void checkForOTAUpdate() {
     beepError();
     delay(1200);
     setAuraIdle();
+    if (commandId >= 0) ackCommand(commandId, false, -1);
     return;
   }
 
@@ -618,6 +633,7 @@ void checkForOTAUpdate() {
     showStatus(STATUS_OK, "OTA", "Up To Date");
     delay(1200);
     setAuraIdle();
+    if (commandId >= 0) ackCommand(commandId, true, -1);
     return;
   }
 
@@ -635,6 +651,7 @@ void checkForOTAUpdate() {
     beepError();
     delay(1200);
     setAuraIdle();
+    if (commandId >= 0) ackCommand(commandId, false, -1);
     return;
   }
 
@@ -646,6 +663,7 @@ void checkForOTAUpdate() {
     showStatus(STATUS_OK, "OTA", "Rebooting");
     beepSuccess();
     delay(1200);
+    if (commandId >= 0) ackCommand(commandId, true, -1);
     ESP.restart();
   } else {
     setAuraError();
@@ -653,7 +671,13 @@ void checkForOTAUpdate() {
     beepError();
     delay(1500);
     setAuraIdle();
+    if (commandId >= 0) ackCommand(commandId, false, -1);
   }
+}
+
+/* "Check Update" menu item: local/manual trigger, no backend ack. */
+void checkForOTAUpdate() {
+  performOTAUpdate(-1);
 }
 
 /* Lightweight reconnect for transient Wi-Fi drops during normal operation.
@@ -1009,6 +1033,8 @@ void pollForCommands() {
     handleRemoteDelete(commandId, targetSlot);
   } else if (commandType == "ENROLL") {
     queuePendingEnroll(commandId, employeeId);
+  } else if (commandType == "UPDATE") {
+    performOTAUpdate(commandId);
   }
 }
 
@@ -1109,7 +1135,7 @@ void setup() {
   // SSD1306 library), so there's no equivalent hard-stop check here -- wiring
   // problems will just show as a blank/garbled screen.
   TFT_display.begin();
-  TFT_display.setRotation(1); // landscape, matches the reference sketch
+  TFT_display.setRotation(0); // portrait (vertical)
 
   showStatus(STATUS_FINGER, "Boot", "Starting");
   delay(500);
