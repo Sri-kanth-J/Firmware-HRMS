@@ -33,7 +33,7 @@
    (from secrets.h) to read it. Scope that token to read-only "Contents"
    access on ONLY this repo -- it's baked into every unit's firmware, so a
    dumped/decompiled device exposes it. */
-#define FIRMWARE_VERSION "1.0.3"
+#define FIRMWARE_VERSION "1.1"
 #define OTA_GITHUB_OWNER "Sri-kanth-J"
 #define OTA_GITHUB_REPO  "Firmware-HRMS"
 #define OTA_ASSET_NAME   "firmware.bin"
