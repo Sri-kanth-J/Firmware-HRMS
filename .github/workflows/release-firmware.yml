@@ -7,7 +7,7 @@ name: Build and release firmware
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v*.*"
 
 permissions:
   contents: write
