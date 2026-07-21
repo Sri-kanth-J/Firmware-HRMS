@@ -66,9 +66,13 @@ jobs:
 
       # If your hardware uses a different ESP32 board/variant, change the FQBN
       # below (and re-check it against your local Arduino IDE board selection).
+      # PartitionScheme=min_spiffs matches the IDE's "Minimal SPIFFS (1.9MB APP
+      # with OTA/190KB SPIFFS)" -- the sketch doesn't use SPIFFS/LittleFS (config
+      # lives in NVS via Preferences), and OTA needs two full app slots, so the
+      # default scheme's 1.25MB-per-slot budget is too tight for this sketch.
       - name: Compile
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32 arduinoCode --output-dir build --warnings default
+          arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs arduinoCode --output-dir build --warnings default
 
       - name: Rename binary to the OTA asset name
         run: cp build/arduinoCode.ino.bin firmware.bin

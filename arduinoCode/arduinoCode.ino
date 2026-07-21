@@ -142,10 +142,11 @@ uint8_t menuIndex = 0;
 
 /* ---------------- App state ----------------
    Boots straight into the clock; the menu only appears once the encoder
-   button is long-pressed (see LONG_PRESS_MS below), and a second long
-   press from the menu returns to the clock. */
+   button is long-pressed (see LONG_PRESS_MS below), and either a second
+   long press or MENU_IDLE_TIMEOUT_MS of inactivity returns to the clock. */
 enum AppState { STATE_CLOCK, STATE_MENU };
 AppState appState = STATE_CLOCK;
+#define MENU_IDLE_TIMEOUT_MS 10000 // idle time in the menu before falling back to the clock
 
 /* ---------------- NTP / IST clock ----------------
    The ESP32 has no battery-backed RTC: time is only known after a
@@ -392,22 +393,24 @@ void syncTimeIfNeeded() {
 }
 
 /* ---------------- Rotary encoder handling ----------------
-   Single-edge decode: only CLK is interrupt-driven (FALLING), and DT's
-   level at that instant gives direction. This is the standard approach for
-   these cheap KY-040-style modules -- one interrupt per detent instead of
-   four (both pins on CHANGE, decoded via a quadrature table), so there's
-   far less ISR overhead and, more importantly, far less exposure to
-   contact bounce: the previous 4x/CHANGE decode had no debounce at all, so
-   bounce on either pin could eat or add spurious transitions and made
-   turns feel like they sometimes needed a re-turn to register ("delay").
-   readEncoderDetents() now returns ticks directly -- no /4 needed. */
-#define ENCODER_DEBOUNCE_MS 2   // reject CLK contact bounce
-#define BUTTON_DEBOUNCE_MS  30  // reject SW contact bounce
-#define LONG_PRESS_MS       600 // hold time that opens/closes the menu
+   Back to the original dual-pin 4x quadrature decode (CLK+DT both on
+   CHANGE, resolved via QUAD_TABLE) -- a single-edge CLK-only decode was
+   tried here but proved less reliable on this hardware, so this reverts to
+   the verified-working approach. Invalid/bounce transitions decode to 0 in
+   the table, which is this scheme's built-in debounce. */
+static const int8_t QUAD_TABLE[16] = {
+   0, -1, +1,  0,
+  +1,  0,  0, -1,
+  -1,  0,  0, +1,
+   0, +1, -1,  0
+};
+
+#define BUTTON_DEBOUNCE_MS 30   // reject SW contact bounce
+#define LONG_PRESS_MS      600  // hold time that opens/closes the menu
 
 // Variables touched inside an ISR must be volatile.
-volatile int32_t encoderCount = 0; // one tick per detent
-volatile uint32_t lastEncoderEdgeMs = 0;
+volatile int32_t encoderCount = 0;  // raw quadrature ticks
+volatile uint8_t encoderState = 0;  // last 2-bit AB state
 
 volatile bool encoderButtonDown = false; // debounced logical button state
 volatile bool buttonDownFlag = false;    // set once per validated press edge
@@ -415,12 +418,13 @@ volatile bool buttonUpFlag = false;      // set once per validated release edge
 volatile uint32_t lastButtonEdgeMs = 0;
 
 void IRAM_ATTR handleEncoderISR() {
-  uint32_t now = millis();
-  if (now - lastEncoderEdgeMs < ENCODER_DEBOUNCE_MS) return;
-  lastEncoderEdgeMs = now;
+  uint8_t a = digitalRead(ENCODER_CLK_PIN);
+  uint8_t b = digitalRead(ENCODER_DT_PIN);
+  uint8_t currentState = (a << 1) | b;
+  uint8_t index = (encoderState << 2) | currentState;
 
-  if (digitalRead(ENCODER_DT_PIN) == HIGH) encoderCount++;
-  else encoderCount--;
+  encoderCount = encoderCount + QUAD_TABLE[index]; // '+=' on volatile is deprecated (C++20)
+  encoderState = currentState;
 }
 
 void IRAM_ATTR handleEncoderButtonISR() {
@@ -438,11 +442,17 @@ void IRAM_ATTR handleEncoderButtonISR() {
   }
 }
 
-int32_t readEncoderDetents() {
+int32_t readEncoderCount() {
   noInterrupts();
   int32_t value = encoderCount;
   interrupts();
   return value;
+}
+
+// This encoder reports 4 quadrature ticks per detent (click) -- divide down
+// to whole menu steps so one click of the knob moves the menu by one item.
+int32_t readEncoderDetents() {
+  return readEncoderCount() / 4;
 }
 
 /* ---------------- Remote configuration ---------------- */
@@ -1266,7 +1276,14 @@ void setup() {
   pinMode(ENCODER_DT_PIN, INPUT_PULLUP);
   pinMode(ENCODER_SW_PIN, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK_PIN), handleEncoderISR, FALLING);
+  // Seed the starting AB state before enabling interrupts so the first
+  // transition decodes correctly.
+  uint8_t initA = digitalRead(ENCODER_CLK_PIN);
+  uint8_t initB = digitalRead(ENCODER_DT_PIN);
+  encoderState = (initA << 1) | initB;
+
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK_PIN), handleEncoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_DT_PIN), handleEncoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_SW_PIN), handleEncoderButtonISR, CHANGE);
 
   // DIYables_TFT_SPI's begin() doesn't return a success flag (unlike the old
@@ -1298,6 +1315,7 @@ void loop() {
   static bool longPressFired = false;
   static uint32_t lastClockUpdateMs = 0;
   static uint32_t lastSyncAttemptMs = 0;
+  static uint32_t lastMenuActivityMs = 0;
 
   // ---- Encoder rotation: only meaningful while the menu is showing ----
   if (appState == STATE_MENU) {
@@ -1308,10 +1326,16 @@ void loop() {
 
       // Clockwise (diff > 0) advances to the next item, counter-clockwise
       // (diff < 0) to the previous one; wraps around either end of the menu.
+      uint8_t oldIndex = menuIndex;
       int32_t newIndex = ((int32_t)menuIndex + diff) % (int32_t)menuCount;
       if (newIndex < 0) newIndex += menuCount;
-      updateMenuSelection(menuIndex, (uint8_t)newIndex);
+      // Update menuIndex BEFORE redrawing -- drawMenuItem() decides
+      // selected/unselected by comparing against the live menuIndex, so
+      // redrawing first (with the old value still in place) highlighted the
+      // outgoing row instead of clearing it.
       menuIndex = (uint8_t)newIndex;
+      updateMenuSelection(oldIndex, menuIndex);
+      lastMenuActivityMs = millis();
     }
   } else {
     // Keep the baseline current so a stray rotation on the clock screen
@@ -1330,6 +1354,7 @@ void loop() {
   if (downFlag) {
     pressStartMs = millis();
     longPressFired = false;
+    lastMenuActivityMs = millis();
   }
 
   if (downNow && !longPressFired && (millis() - pressStartMs >= LONG_PRESS_MS)) {
@@ -1338,6 +1363,7 @@ void loop() {
       lastReportedDetent = readEncoderDetents(); // don't carry over stray rotation into the menu
       drawMenu();
       appState = STATE_MENU;
+      lastMenuActivityMs = millis();
     } else {
       enterClockState();
     }
@@ -1356,6 +1382,12 @@ void loop() {
     setAuraIdle();
     drawMenu();
     lastReportedDetent = readEncoderDetents(); // discard ticks that piled up during the (blocking) action
+    lastMenuActivityMs = millis();
+  }
+
+  // ---- Menu idle timeout: fall back to the clock after 10s of inactivity ----
+  if (appState == STATE_MENU && millis() - lastMenuActivityMs >= MENU_IDLE_TIMEOUT_MS) {
+    enterClockState();
   }
 
   // ---- Clock tick / opportunistic re-sync ----
