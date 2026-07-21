@@ -32,7 +32,7 @@
    (from secrets.h) to read it. Scope that token to read-only "Contents"
    access on ONLY this repo -- it's baked into every unit's firmware, so a
    dumped/decompiled device exposes it. */
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "1.0.2"
 #define OTA_GITHUB_OWNER "Sri-kanth-J"
 #define OTA_GITHUB_REPO  "Firmware-HRMS"
 #define OTA_ASSET_NAME   "firmware.bin"
@@ -135,7 +135,7 @@ bool haveParams = false;
    drawStatusIcon), replacing the old 16x16 monochrome OLED bitmaps. */
 enum StatusIcon { STATUS_FINGER, STATUS_OK, STATUS_ERROR, STATUS_WIFI };
 
-const char *menuItems[] = {"Log In", "Pending Enrolls", "Device Setup", "Check Update"};
+const char *menuItems[] = {"Log In", "Enrolls", "Device Setup", "Check Update", "Restart"};
 const uint8_t menuCount = sizeof(menuItems) / sizeof(menuItems[0]);
 uint8_t menuIndex = 0;
 
@@ -585,6 +585,10 @@ void performOTAUpdate(long commandId) {
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     Serial.printf("[OTA] releases/latest HTTP %d\n", code);
+    // 404 here almost always means either GITHUB_PAT is a placeholder/invalid/expired
+    // (GitHub hides private-repo existence behind 404 rather than 401/403), or the repo
+    // has no published (non-draft, non-prerelease) release yet.
+    if (code > 0) Serial.println("[OTA] Response body: " + http.getString());
     http.end();
     setAuraError();
     showStatus(STATUS_ERROR, "OTA", "Check Failed");
@@ -1110,6 +1114,15 @@ bool doLogin() {
   return false;
 }
 
+/* "Restart" menu item: manual reboot, e.g. to recover from a stuck state
+   without a power cycle. */
+void doRestart() {
+  showStatus(STATUS_WIFI, "Device", "Restarting");
+  beepSuccess();
+  delay(600);
+  ESP.restart();
+}
+
 /* ---------------- Arduino lifecycle ---------------- */
 void setup() {
   Serial.begin(115200);
@@ -1135,7 +1148,7 @@ void setup() {
   // SSD1306 library), so there's no equivalent hard-stop check here -- wiring
   // problems will just show as a blank/garbled screen.
   TFT_display.begin();
-  TFT_display.setRotation(0); // portrait (vertical)
+  TFT_display.setRotation(2); // portrait (vertical), flipped 180 from rotation 0 for this panel's mounting
 
   showStatus(STATUS_FINGER, "Boot", "Starting");
   delay(500);
@@ -1180,6 +1193,7 @@ void loop() {
       case 1: doRemoteEnroll(); break;
       case 2: runConfigPortal(true); break;
       case 3: checkForOTAUpdate(); break;
+      case 4: doRestart(); break;
       default: break;
     }
     setAuraIdle();
