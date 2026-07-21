@@ -7,6 +7,7 @@
 #include <WiFiManager.h>
 #include <Preferences.h>
 #include <DIYables_TFT_SPI.h>
+#include <time.h>
 #include "secrets.h" // GITHUB_PAT -- copy secrets.h.example to secrets.h and fill in a real token
 
 /* ---------------- Factory defaults ----------------
@@ -32,7 +33,7 @@
    (from secrets.h) to read it. Scope that token to read-only "Contents"
    access on ONLY this repo -- it's baked into every unit's firmware, so a
    dumped/decompiled device exposes it. */
-#define FIRMWARE_VERSION "1.0.2"
+#define FIRMWARE_VERSION "1.0.3"
 #define OTA_GITHUB_OWNER "Sri-kanth-J"
 #define OTA_GITHUB_REPO  "Firmware-HRMS"
 #define OTA_ASSET_NAME   "firmware.bin"
@@ -139,6 +140,25 @@ const char *menuItems[] = {"Log In", "Enrolls", "Device Setup", "Check Update", 
 const uint8_t menuCount = sizeof(menuItems) / sizeof(menuItems[0]);
 uint8_t menuIndex = 0;
 
+/* ---------------- App state ----------------
+   Boots straight into the clock; the menu only appears once the encoder
+   button is long-pressed (see LONG_PRESS_MS below), and a second long
+   press from the menu returns to the clock. */
+enum AppState { STATE_CLOCK, STATE_MENU };
+AppState appState = STATE_CLOCK;
+
+/* ---------------- NTP / IST clock ----------------
+   The ESP32 has no battery-backed RTC: time is only known after a
+   successful NTP sync while Wi-Fi is up, then free-runs off the internal
+   RTC (fine for a UI clock across brief Wi-Fi drops, resets to "unsynced"
+   on power loss). Synced opportunistically whenever Wi-Fi comes up (see
+   runConfigPortal()/quickReconnectWiFi()) and retried from loop() while
+   the clock screen is showing and still unsynced. */
+#define IST_OFFSET_SEC (5 * 3600 + 30 * 60) // UTC+5:30, no DST
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.google.com"
+bool timeSynced = false;
+
 void setSensorAura(uint8_t control, uint8_t speed, uint8_t color, uint8_t cycles) {
   if (!sensorReady) return;
   (void)finger.ledConfigure(control, speed, color, cycles);
@@ -225,94 +245,204 @@ void showStatus(StatusIcon icon, const char *line1, const char *line2) {
   TFT_display.print(line2);
 }
 
-void drawMenu() {
+#define MENU_BANNER_H 44
+#define MENU_ITEM_H   44
+#define MENU_START_Y  (MENU_BANNER_H + 46)
+
+/* Header + Wi-Fi status line only -- drawn once when the menu is entered. */
+void drawMenuHeader() {
   TFT_display.fillScreen(TFT_WHITE);
 
-  // Header banner
-  int bannerH = 44;
-  TFT_display.fillRect(0, 0, TFT_display.width(), bannerH, TFT_VIOLET);
+  TFT_display.fillRect(0, 0, TFT_display.width(), MENU_BANNER_H, TFT_VIOLET);
   TFT_display.setTextColor(TFT_WHITE);
   TFT_display.setTextSize(2);
   TFT_display.setCursor(10, 12);
   TFT_display.print("Attendance");
 
-  // Wi-Fi status line
   bool wifiOn = (WiFi.status() == WL_CONNECTED);
   TFT_display.setTextSize(2);
   TFT_display.setTextColor(TFT_BLACK);
-  TFT_display.setCursor(10, bannerH + 12);
+  TFT_display.setCursor(10, MENU_BANNER_H + 12);
+  TFT_display.print("WiFi: ");
+  TFT_display.setTextColor(wifiOn ? TFT_GREEN : TFT_RED);
+  TFT_display.print(wifiOn ? "ON" : "OFF");
+}
+
+/* Redraws just one item row (selected or not). Used both for the initial
+   full menu draw and for cheap per-row updates while scrolling. */
+void drawMenuItem(uint8_t i) {
+  int y = MENU_START_Y + i * MENU_ITEM_H;
+  bool selected = (i == menuIndex);
+
+  TFT_display.fillRect(0, y, TFT_display.width(), MENU_ITEM_H - 6, selected ? TFT_CYAN : TFT_WHITE);
+  TFT_display.setTextColor(selected ? TFT_BLACK : TFT_GRAY);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(16, y + 10);
+  TFT_display.print(menuItems[i]);
+  if (i == 1) {
+    TFT_display.print(" (");
+    TFT_display.print(pendingEnrollCount);
+    TFT_display.print(")");
+  }
+}
+
+void drawMenu() {
+  drawMenuHeader();
+  for (uint8_t i = 0; i < menuCount; i++) drawMenuItem(i);
+}
+
+/* Repaints only the previously- and newly-selected rows instead of the
+   whole screen -- a full drawMenu() redraw (fillScreen + banner + all rows)
+   over SPI is slow enough to feel laggy when scrolling quickly through the
+   menu; touching just the two changed rows makes rotation feel instant. */
+void updateMenuSelection(uint8_t oldIndex, uint8_t newIndex) {
+  if (oldIndex == newIndex) return;
+  drawMenuItem(oldIndex);
+  drawMenuItem(newIndex);
+}
+
+/* ---------------- Clock screen ---------------- */
+#define CLOCK_TIME_Y 130
+#define CLOCK_TIME_H 44
+#define CLOCK_DATE_Y 182
+#define CLOCK_DATE_H 26
+
+/* Static chrome (banner, Wi-Fi line, hint) -- drawn once on entering the
+   clock screen and again only when Wi-Fi status is worth refreshing. */
+void drawClockStatic() {
+  TFT_display.fillScreen(TFT_WHITE);
+
+  TFT_display.fillRect(0, 0, TFT_display.width(), MENU_BANNER_H, TFT_VIOLET);
+  TFT_display.setTextColor(TFT_WHITE);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(10, 12);
+  TFT_display.print("Attendance");
+
+  bool wifiOn = (WiFi.status() == WL_CONNECTED);
+  TFT_display.setTextSize(2);
+  TFT_display.setTextColor(TFT_BLACK);
+  TFT_display.setCursor(10, MENU_BANNER_H + 12);
   TFT_display.print("WiFi: ");
   TFT_display.setTextColor(wifiOn ? TFT_GREEN : TFT_RED);
   TFT_display.print(wifiOn ? "ON" : "OFF");
 
-  // Menu items, selected one highlighted
-  int itemH = 44;
-  int startY = bannerH + 46;
-  for (uint8_t i = 0; i < menuCount; i++) {
-    int y = startY + i * itemH;
-    bool selected = (i == menuIndex);
+  TFT_display.setTextColor(TFT_GRAY);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(10, TFT_display.height() - 30);
+  TFT_display.print("Hold button: Menu");
+}
 
-    if (selected) {
-      TFT_display.fillRect(0, y, TFT_display.width(), itemH - 6, TFT_CYAN);
+/* Redraws just the time/date area -- called once a second, so it must not
+   touch the rest of the screen (fillScreen there would flicker every tick). */
+void drawClockTime() {
+  char timeBuf[12];
+  if (!timeSynced) {
+    snprintf(timeBuf, sizeof(timeBuf), "Syncing..");
+  } else {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 0)) {
+      snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    } else {
+      snprintf(timeBuf, sizeof(timeBuf), "--:--:--");
     }
-    TFT_display.setTextColor(selected ? TFT_BLACK : TFT_GRAY);
-    TFT_display.setTextSize(2);
-    TFT_display.setCursor(16, y + 10);
-    TFT_display.print(menuItems[i]);
-    if (i == 1) {
-      TFT_display.print(" (");
-      TFT_display.print(pendingEnrollCount);
-      TFT_display.print(")");
+  }
+
+  TFT_display.fillRect(0, CLOCK_TIME_Y, TFT_display.width(), CLOCK_TIME_H, TFT_WHITE);
+  TFT_display.setTextColor(TFT_BLACK);
+  TFT_display.setTextSize(4);
+  int textW = (int)strlen(timeBuf) * 6 * 4; // font cell is ~6px wide at textSize 1
+  int textX = (TFT_display.width() - textW) / 2;
+  if (textX < 0) textX = 4;
+  TFT_display.setCursor(textX, CLOCK_TIME_Y + 4);
+  TFT_display.print(timeBuf);
+
+  TFT_display.fillRect(0, CLOCK_DATE_Y, TFT_display.width(), CLOCK_DATE_H, TFT_WHITE);
+  if (timeSynced) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 0)) {
+      static const char *weekday[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+      char dateBuf[24];
+      snprintf(dateBuf, sizeof(dateBuf), "%s %02d-%02d-%04d IST",
+               weekday[timeinfo.tm_wday], timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+      int dateW = (int)strlen(dateBuf) * 6 * 2;
+      int dateX = (TFT_display.width() - dateW) / 2;
+      if (dateX < 0) dateX = 4;
+      TFT_display.setTextColor(TFT_GRAY);
+      TFT_display.setTextSize(2);
+      TFT_display.setCursor(dateX, CLOCK_DATE_Y);
+      TFT_display.print(dateBuf);
     }
   }
 }
 
-/* ---------------- Rotary encoder handling ---------------- */
-/* Quadrature decode table -- index = (previous AB state << 2) | current AB
-   state, value = position delta for that transition. Invalid/bounce
-   transitions decode to 0. */
-static const int8_t QUAD_TABLE[16] = {
-   0, -1, +1,  0,
-  +1,  0,  0, -1,
-  -1,  0,  0, +1,
-   0, +1, -1,  0
-};
+void enterClockState() {
+  appState = STATE_CLOCK;
+  drawClockStatic();
+  drawClockTime();
+}
+
+/* Kicks off (or retries) NTP sync. Safe to call opportunistically -- it's a
+   no-op without Wi-Fi, and configTime()/getLocalTime() are cheap once
+   already synced. */
+void syncTimeIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  configTime(IST_OFFSET_SEC, 0, NTP_SERVER_1, NTP_SERVER_2);
+  struct tm timeinfo;
+  timeSynced = getLocalTime(&timeinfo, 5000);
+}
+
+/* ---------------- Rotary encoder handling ----------------
+   Single-edge decode: only CLK is interrupt-driven (FALLING), and DT's
+   level at that instant gives direction. This is the standard approach for
+   these cheap KY-040-style modules -- one interrupt per detent instead of
+   four (both pins on CHANGE, decoded via a quadrature table), so there's
+   far less ISR overhead and, more importantly, far less exposure to
+   contact bounce: the previous 4x/CHANGE decode had no debounce at all, so
+   bounce on either pin could eat or add spurious transitions and made
+   turns feel like they sometimes needed a re-turn to register ("delay").
+   readEncoderDetents() now returns ticks directly -- no /4 needed. */
+#define ENCODER_DEBOUNCE_MS 2   // reject CLK contact bounce
+#define BUTTON_DEBOUNCE_MS  30  // reject SW contact bounce
+#define LONG_PRESS_MS       600 // hold time that opens/closes the menu
 
 // Variables touched inside an ISR must be volatile.
-volatile int32_t encoderCount = 0;  // raw quadrature ticks
-volatile uint8_t encoderState = 0;  // last 2-bit AB state
-volatile bool encoderButtonPressed = false;
-volatile uint32_t lastEncoderButtonMs = 0;
+volatile int32_t encoderCount = 0; // one tick per detent
+volatile uint32_t lastEncoderEdgeMs = 0;
+
+volatile bool encoderButtonDown = false; // debounced logical button state
+volatile bool buttonDownFlag = false;    // set once per validated press edge
+volatile bool buttonUpFlag = false;      // set once per validated release edge
+volatile uint32_t lastButtonEdgeMs = 0;
 
 void IRAM_ATTR handleEncoderISR() {
-  uint8_t a = digitalRead(ENCODER_CLK_PIN);
-  uint8_t b = digitalRead(ENCODER_DT_PIN);
-  uint8_t currentState = (a << 1) | b;
-  uint8_t index = (encoderState << 2) | currentState;
+  uint32_t now = millis();
+  if (now - lastEncoderEdgeMs < ENCODER_DEBOUNCE_MS) return;
+  lastEncoderEdgeMs = now;
 
-  encoderCount += QUAD_TABLE[index];
-  encoderState = currentState;
+  if (digitalRead(ENCODER_DT_PIN) == HIGH) encoderCount++;
+  else encoderCount--;
 }
 
 void IRAM_ATTR handleEncoderButtonISR() {
-  uint32_t now = millis(); // acceptable in Arduino-ESP32 ISR for simple debounce usage
-  if (now - lastEncoderButtonMs > 200) {
-    encoderButtonPressed = true;
-    lastEncoderButtonMs = now;
+  uint32_t now = millis();
+  if (now - lastButtonEdgeMs < BUTTON_DEBOUNCE_MS) return;
+  lastButtonEdgeMs = now;
+
+  bool pressedNow = (digitalRead(ENCODER_SW_PIN) == LOW); // active low, INPUT_PULLUP
+  if (pressedNow && !encoderButtonDown) {
+    encoderButtonDown = true;
+    buttonDownFlag = true;
+  } else if (!pressedNow && encoderButtonDown) {
+    encoderButtonDown = false;
+    buttonUpFlag = true;
   }
 }
 
-int32_t readEncoderCount() {
+int32_t readEncoderDetents() {
   noInterrupts();
   int32_t value = encoderCount;
   interrupts();
   return value;
-}
-
-// This encoder reports 4 quadrature ticks per detent (click) -- divide down
-// to whole menu steps so one click of the knob moves the menu by one item.
-int32_t readEncoderDetents() {
-  return readEncoderCount() / 4;
 }
 
 /* ---------------- Remote configuration ---------------- */
@@ -405,6 +535,7 @@ bool runConfigPortal(bool forcePortal) {
   if (connected) {
     setAuraSuccess();
     showStatus(STATUS_OK, "Wi-Fi", "Connected");
+    syncTimeIfNeeded();
     delay(700);
   } else if (shouldSaveConfig) {
     setAuraSuccess();
@@ -704,6 +835,7 @@ bool quickReconnectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     setAuraSuccess();
     showStatus(STATUS_OK, "Wi-Fi", "Connected");
+    syncTimeIfNeeded();
     delay(700);
     setAuraIdle();
     return true;
@@ -1134,15 +1266,8 @@ void setup() {
   pinMode(ENCODER_DT_PIN, INPUT_PULLUP);
   pinMode(ENCODER_SW_PIN, INPUT_PULLUP);
 
-  // Seed the starting AB state before enabling interrupts so the first
-  // transition decodes correctly.
-  uint8_t initA = digitalRead(ENCODER_CLK_PIN);
-  uint8_t initB = digitalRead(ENCODER_DT_PIN);
-  encoderState = (initA << 1) | initB;
-
-  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK_PIN), handleEncoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_DT_PIN), handleEncoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_SW_PIN), handleEncoderButtonISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK_PIN), handleEncoderISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_SW_PIN), handleEncoderButtonISR, CHANGE);
 
   // DIYables_TFT_SPI's begin() doesn't return a success flag (unlike the old
   // SSD1306 library), so there's no equivalent hard-stop check here -- wiring
@@ -1163,30 +1288,62 @@ void setup() {
   }
 
   setAuraIdle();
-  drawMenu();
+  syncTimeIfNeeded();
+  enterClockState();
 }
 
 void loop() {
   static int32_t lastReportedDetent = 0;
+  static uint32_t pressStartMs = 0;
+  static bool longPressFired = false;
+  static uint32_t lastClockUpdateMs = 0;
+  static uint32_t lastSyncAttemptMs = 0;
 
-  int32_t detents = readEncoderDetents();
-  if (detents != lastReportedDetent) {
-    int32_t diff = detents - lastReportedDetent;
-    lastReportedDetent = detents;
+  // ---- Encoder rotation: only meaningful while the menu is showing ----
+  if (appState == STATE_MENU) {
+    int32_t detents = readEncoderDetents();
+    if (detents != lastReportedDetent) {
+      int32_t diff = detents - lastReportedDetent;
+      lastReportedDetent = detents;
 
-    // Clockwise (diff > 0) advances to the next item, counter-clockwise
-    // (diff < 0) to the previous one; wraps around either end of the menu.
-    int32_t newIndex = ((int32_t)menuIndex + diff) % (int32_t)menuCount;
-    if (newIndex < 0) newIndex += menuCount;
-    menuIndex = (uint8_t)newIndex;
-    drawMenu();
+      // Clockwise (diff > 0) advances to the next item, counter-clockwise
+      // (diff < 0) to the previous one; wraps around either end of the menu.
+      int32_t newIndex = ((int32_t)menuIndex + diff) % (int32_t)menuCount;
+      if (newIndex < 0) newIndex += menuCount;
+      updateMenuSelection(menuIndex, (uint8_t)newIndex);
+      menuIndex = (uint8_t)newIndex;
+    }
+  } else {
+    // Keep the baseline current so a stray rotation on the clock screen
+    // doesn't cause a jump the moment the menu opens.
+    lastReportedDetent = readEncoderDetents();
   }
 
-  if (encoderButtonPressed) {
-    noInterrupts();
-    encoderButtonPressed = false;
-    interrupts();
+  // ---- Encoder button: short press = select, long press = open/close menu ----
+  bool downFlag, upFlag, downNow;
+  noInterrupts();
+  downFlag = buttonDownFlag; buttonDownFlag = false;
+  upFlag = buttonUpFlag; buttonUpFlag = false;
+  downNow = encoderButtonDown;
+  interrupts();
 
+  if (downFlag) {
+    pressStartMs = millis();
+    longPressFired = false;
+  }
+
+  if (downNow && !longPressFired && (millis() - pressStartMs >= LONG_PRESS_MS)) {
+    longPressFired = true;
+    if (appState == STATE_CLOCK) {
+      lastReportedDetent = readEncoderDetents(); // don't carry over stray rotation into the menu
+      drawMenu();
+      appState = STATE_MENU;
+    } else {
+      enterClockState();
+    }
+  }
+
+  if (upFlag && !longPressFired && appState == STATE_MENU) {
     setAuraProcessing();
     switch (menuIndex) {
       case 0: doLogin(); break;
@@ -1198,13 +1355,28 @@ void loop() {
     }
     setAuraIdle();
     drawMenu();
+    lastReportedDetent = readEncoderDetents(); // discard ticks that piled up during the (blocking) action
   }
 
+  // ---- Clock tick / opportunistic re-sync ----
+  if (appState == STATE_CLOCK) {
+    if (!timeSynced && millis() - lastSyncAttemptMs > 15000) {
+      lastSyncAttemptMs = millis();
+      syncTimeIfNeeded();
+    }
+    if (millis() - lastClockUpdateMs >= 1000) {
+      lastClockUpdateMs = millis();
+      drawClockTime();
+    }
+  }
+
+  // ---- Background command polling ----
   if (millis() - lastPollMs > POLL_INTERVAL_MS) {
     pollForCommands();
     lastPollMs = millis();
-    drawMenu();
+    if (appState == STATE_MENU) drawMenu();
+    else enterClockState();
   }
 
-  delay(15);
+  delay(5);
 }
