@@ -1,0 +1,46 @@
+name: Tag on merge to main
+
+# When a PR whose title carries a [vX.Y] tag (see pr-title-version.yml) is
+# merged to main, this creates and pushes that tag -- which in turn triggers
+# release-firmware.yml to build and publish the release.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Extract version from PR title
+        id: version
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          TAG=$(echo "$TITLE" | grep -oE '\[v[0-9]+\.[0-9]+(\.[0-9]+)?\]' | head -1 | tr -d '[]')
+          if [ -z "$TAG" ]; then
+            echo "::error::No [vX.Y] version tag found in PR title: \"$TITLE\""
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists -- pick a different version in the PR title"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"

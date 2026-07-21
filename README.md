@@ -10,6 +10,8 @@ arduinoCode/
   arduinoCode.ino       -- the firmware
   secrets.h.example      -- template for the local-only GITHUB_PAT
 .github/workflows/
+  pr-title-version.yml   -- checks every PR into main has a [vX.Y] tag in its title
+  tag-on-merge.yml       -- tags main with that version when the PR merges
   release-firmware.yml   -- builds + publishes a release on every version tag
 ```
 
@@ -32,20 +34,27 @@ arduinoCode/
 
 ## Cutting a release
 
+`main` is protected -- no direct pushes, everything goes through a PR. Give the PR
+a title that includes the version to ship, in `[vX.Y]` form, e.g.:
+
 ```
-git tag v1.0.1
-git push origin v1.0.1
+[v0.2] Fix rotary encoder debounce
 ```
 
-Pushing a tag matching `v*.*.*` triggers `.github/workflows/release-firmware.yml`,
-which:
-1. Stamps `FIRMWARE_VERSION` in `arduinoCode.ino` to match the tag (so you don't have
-   to hand-edit it before tagging).
+`pr-title-version.yml` blocks any PR into `main` that's missing that tag. Once the
+PR is merged, `tag-on-merge.yml` pulls the version back out of the title, tags
+`main` with it, and pushes the tag -- which triggers
+`.github/workflows/release-firmware.yml`:
+1. Stamps `FIRMWARE_VERSION` in `arduinoCode.ino` to match the tag.
 2. Writes `secrets.h` from the `DEVICE_OTA_PAT` secret.
 3. Compiles with `arduino-cli` for FQBN `esp32:esp32:esp32` (change this in the
    workflow if your hardware uses a different ESP32 board/variant).
 4. Publishes a GitHub Release tagged with that version, with the compiled binary
    attached as `firmware.bin`.
+
+You can still cut a one-off release by tagging manually (`git tag vX.Y && git push
+origin vX.Y`) -- tag pushes aren't blocked by the branch protection on `main`, only
+direct commits to the branch are.
 
 ## How devices update
 

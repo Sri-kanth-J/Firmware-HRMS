@@ -1,6 +1,6 @@
 name: Build and release firmware
 
-# Cut a release by tagging: git tag v1.0.1 && git push origin v1.0.1
+# Cut a release by tagging: git tag v0.1 && git push origin v0.1
 # CI stamps that version into the sketch, compiles it, and publishes it as a
 # GitHub Release with firmware.bin attached -- which is what devices pull
 # down via the "Check Update" menu item.

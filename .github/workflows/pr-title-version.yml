@@ -1,0 +1,22 @@
+name: Validate PR version tag
+
+# Every PR merged to main becomes a release (see tag-on-merge.yml), so the PR
+# title must carry the version to tag, e.g. "[v0.2] Fix menu highlight bug".
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  check-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a [vX.Y] version tag in the PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if ! echo "$TITLE" | grep -qE '\[v[0-9]+\.[0-9]+(\.[0-9]+)?\]'; then
+            echo "::error::PR title must include a version tag like [v0.2] (got: \"$TITLE\")"
+            exit 1
+          fi
+          echo "OK: $TITLE"
