@@ -54,6 +54,11 @@ String commandsNextUrl;
 
 Preferences prefs;
 bool shouldSaveConfig = false;
+// Read by configPortalStartedCallback -- true only while the config portal was
+// opened on demand from the "Device Setup" menu item (see runConfigPortal),
+// so its "press button: back" hint is only shown when a button-poll loop is
+// actually watching for that press.
+bool configPortalCancellable = false;
 
 WiFiClient secureClient;
 
@@ -539,9 +544,43 @@ void saveConfigCallback() {
   shouldSaveConfig = true;
 }
 
+/* Dedicated setup-mode screen rather than the generic showStatus() (which
+   only fits one short message) -- the AP name has to actually be read and
+   joined by the user, so it gets a line of its own, plus an explicit hint
+   for getting back out without waiting through the full portal timeout.
+   `cancellable` is only true when the portal was opened on demand from the
+   menu (see runConfigPortal): at boot there's no menu to return to and no
+   button-poll loop watching for a press, so the hint would be a lie. */
+void drawSetupModeScreen(bool cancellable) {
+  int bannerH = 56;
+  TFT_display.fillScreen(TFT_WHITE);
+
+  TFT_display.fillRect(0, 0, TFT_display.width(), bannerH, TFT_BLUE);
+  drawStatusIcon(STATUS_WIFI, 28, bannerH / 2, 16, TFT_WHITE);
+  TFT_display.setTextColor(TFT_WHITE);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(56, bannerH / 2 - 8);
+  TFT_display.print("Setup Mode");
+
+  TFT_display.setTextColor(TFT_BLACK);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(20, bannerH + 26);
+  TFT_display.print("Join WiFi to setup:");
+
+  TFT_display.setTextColor(TFT_BLUE);
+  TFT_display.setTextSize(3);
+  TFT_display.setCursor(20, bannerH + 60);
+  TFT_display.print("Device-Setup");
+
+  TFT_display.setTextColor(TFT_GRAY);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(20, TFT_display.height() - 30);
+  TFT_display.print(cancellable ? "Press button: Back" : "Waiting...");
+}
+
 void configPortalStartedCallback(WiFiManager *wmPtr) {
   setAuraWiFi();
-  showStatus(STATUS_WIFI, "Setup Mode", "Device-Setup");
+  drawSetupModeScreen(configPortalCancellable);
 }
 
 /* Single portal, two menu entries: connecting to the "Device-Setup" access
@@ -577,13 +616,40 @@ bool runConfigPortal(bool forcePortal) {
 
   shouldSaveConfig = false;
   bool connected;
+  bool cancelled = false;
+  configPortalCancellable = forcePortal; // read by configPortalStartedCallback
+
   if (forcePortal) {
     showStatus(STATUS_WIFI, "Setup Mode", "Starting AP");
     delay(400);
-    connected = wm.startConfigPortal("Device-Setup");
+
+    // Non-blocking: startConfigPortal() would otherwise block right here
+    // until connected/saved/timed out, with no way for the menu button to
+    // break out early. Pumping process() ourselves (same button-poll style
+    // as promptOTAConfirmation()) lets a short press cancel straight back
+    // to the menu instead of waiting out the full 180s timeout.
+    wm.setConfigPortalBlocking(false);
+    wm.startConfigPortal("Device-Setup");
+    while (wm.getConfigPortalActive()) {
+      wm.process();
+
+      noInterrupts();
+      buttonDownFlag = false; // consumed here so it isn't replayed as a fresh menu press once we return
+      bool upFlag = buttonUpFlag;
+      buttonUpFlag = false;
+      interrupts();
+
+      if (upFlag) {
+        cancelled = true;
+        wm.stopConfigPortal();
+        break;
+      }
+    }
+    connected = (WiFi.status() == WL_CONNECTED);
   } else {
     connected = wm.autoConnect("Device-Setup");
   }
+  configPortalCancellable = false;
 
   // Backend fields are only in play if the "Configure Backend" page was used --
   // check that regardless of whether Wi-Fi itself was touched this session.
@@ -603,6 +669,10 @@ bool runConfigPortal(bool forcePortal) {
   } else if (shouldSaveConfig) {
     setAuraSuccess();
     showStatus(STATUS_OK, "Backend", "Saved");
+    delay(700);
+  } else if (cancelled) {
+    setAuraIdle();
+    showStatus(STATUS_ERROR, "Setup", "Cancelled");
     delay(700);
   } else {
     setAuraError();
