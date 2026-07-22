@@ -1,8 +1,15 @@
 name: Tag on merge to main
 
 # When a PR whose title carries a [vX.Y] tag (see pr-title-version.yml) is
-# merged to main, this creates and pushes that tag -- which in turn triggers
+# merged to main, this creates and pushes that tag, then explicitly kicks off
 # release-firmware.yml to build and publish the release.
+#
+# The explicit workflow_dispatch call (rather than relying on
+# release-firmware.yml's own `push: tags` trigger) is required: this job
+# pushes the tag using the default GITHUB_TOKEN, and GitHub Actions doesn't
+# let GITHUB_TOKEN-authored pushes trigger other workflow runs (an
+# anti-recursion safeguard) -- so the tag push alone would silently never
+# start a build.
 on:
   pull_request:
     types: [closed]
@@ -10,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -44,3 +52,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.version.outputs.tag }}" -m "${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Trigger firmware release build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-firmware.yml --ref main -f tag="${{ steps.version.outputs.tag }}"

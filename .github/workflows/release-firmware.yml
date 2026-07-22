@@ -4,10 +4,21 @@ name: Build and release firmware
 # CI stamps that version into the sketch, compiles it, and publishes it as a
 # GitHub Release with firmware.bin attached -- which is what devices pull
 # down via the "Check Update" menu item.
+#
+# Also runnable manually (workflow_dispatch) for a tag that already exists --
+# tag-on-merge.yml uses this to kick off a build explicitly, since a tag it
+# pushes with the default GITHUB_TOKEN won't trigger the `push: tags` trigger
+# below (GitHub Actions doesn't let GITHUB_TOKEN-authored pushes cascade into
+# other workflow runs, to prevent recursive triggering).
 on:
   push:
     tags:
       - "v*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.2) -- must already exist"
+        required: true
 
 permissions:
   contents: write
@@ -18,11 +29,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Derive version from tag
         id: version
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF#refs/tags/}"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
@@ -77,10 +91,15 @@ jobs:
       - name: Rename binary to the OTA asset name
         run: cp build/arduinoCode.ino.bin firmware.bin
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.version.outputs.tag }}" firmware.bin \
-            --title "${{ steps.version.outputs.tag }}" \
-            --generate-notes
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Release already exists (e.g. created by hand before this workflow
+            # got a chance to run) -- just attach/replace the binary on it.
+            gh release upload "$TAG" firmware.bin --clobber
+          else
+            gh release create "$TAG" firmware.bin --title "$TAG" --generate-notes
+          fi
