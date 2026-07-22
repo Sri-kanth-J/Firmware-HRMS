@@ -9,6 +9,7 @@
 #include <DIYables_TFT_SPI.h>
 #include <time.h>
 #include "secrets.h" // GITHUB_PAT -- copy secrets.h.example to secrets.h and fill in a real token
+#include "ota_types.h" // OTAFetchStatus / OTAReleaseInfo -- see that header for why these aren't defined inline here
 
 /* ---------------- Factory defaults ----------------
    Used only the very first time the device boots, before anything has been
@@ -736,18 +737,10 @@ bool otaDownloadAndFlash(const String &assetApiUrl) {
   return true;
 }
 
-/* Outcome of querying GitHub for the latest release. Split out of
-   performOTAUpdate so the fetch/parse logic can be shared between the
-   remote-triggered path (applies unconditionally) and the manual "Check
-   Update" path (shows the version and asks for confirmation first). */
-enum OTAFetchStatus { OTA_FETCH_HTTP_ERROR, OTA_FETCH_BAD_JSON, OTA_FETCH_NO_RELEASE, OTA_FETCH_OK };
-
-struct OTAReleaseInfo {
-  OTAFetchStatus status;
-  String version;
-  String assetUrl; // empty if this release has no asset named OTA_ASSET_NAME
-};
-
+/* Queries the latest GitHub release. Split out of performOTAUpdate so the
+   fetch/parse logic can be shared between the remote-triggered path (applies
+   unconditionally) and the manual "Check Update" path (shows the version and
+   asks for confirmation first). Return type defined in ota_types.h. */
 OTAReleaseInfo fetchLatestRelease() {
   OTAReleaseInfo info;
   info.status = OTA_FETCH_HTTP_ERROR;
