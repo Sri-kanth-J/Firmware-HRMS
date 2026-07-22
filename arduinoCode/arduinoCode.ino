@@ -1372,18 +1372,132 @@ void handleRemoteDelete(long commandId, long targetSlot) {
   ackCommand(commandId, ok, -1);
 }
 
+/* ---------------- Raw sensor slot-index read ----------------
+   The FPM library's public API only exposes getFreeIndex(), which returns
+   just the FIRST free slot per "page" and discards the rest of the
+   occupancy bitmap it parses internally (see the library's own fpm.cpp) --
+   there's no public method to read the full per-page bitmap, and
+   writePacket()/readPacket()/the internal response buffer are all private
+   to the FPM class.
+
+   Patching the library itself was tried and reverted: this project's CI
+   (release-firmware.yml) and a fresh `arduino-cli lib install --git-url
+   .../FPM.git` both always pull the upstream repo's own default branch, so
+   a local-only patch to the installed library silently disappears on any
+   clean checkout/CI run -- it compiled locally but broke CI with "'class
+   FPM' has no member named 'getIndexTable'".
+
+   Instead, this reimplements just the one needed sensor command
+   (PS_ReadIndexTable / FPM_READTEMPLATEINDEX, 0x1F) directly against
+   sensorSerial, using only the public protocol constants fpm.h already
+   exposes. Packet framing mirrors FPM::writePacket()/readPacket() exactly
+   (verified against the library's source): big-endian multi-byte fields,
+   checksum = sum of packet-id + length + payload bytes. Unlike the
+   library's reader, this doesn't attempt to resync on a mid-packet error
+   (wrong address/pktId/checksum just fails outright rather than rescanning
+   for the next header) -- an acceptable simplification for an occasional,
+   retry-if-it-fails diagnostic command. */
+bool readSensorByte(uint8_t *out, uint32_t deadlineMs) {
+  while (millis() < deadlineMs) {
+    if (sensorSerial.available() > 0) {
+      *out = (uint8_t)sensorSerial.read();
+      return true;
+    }
+    yield();
+  }
+  return false;
+}
+
+/* Reads the occupancy bitmap for one page (256 slots) directly off the
+   sensor. tableBuf must be at least 32 bytes (FPM_TEMPLATES_PER_PAGE / 8);
+   on success, exactly 32 bytes are written -- 1 bit per slot, LSb of
+   tableBuf[0] is slot 0, bit set = occupied, clear = free. Returns true on
+   success (including a well-formed NOK response from the sensor -- callers
+   should check via the sensor's own confirm code if that distinction ever
+   matters; here it's folded into "false" like any other read failure since
+   handleListSlots() only needs success/fail). */
+bool readSensorIndexTable(uint8_t page, uint8_t *tableBuf, uint8_t tableBufLen) {
+  uint8_t payload[2] = { (uint8_t)FPM_READTEMPLATEINDEX, page };
+  uint16_t totalLen = sizeof(payload) + 2; // +2 for the trailing checksum
+
+  sensorSerial.write((uint8_t)(FPM_STARTCODE >> 8));
+  sensorSerial.write((uint8_t)FPM_STARTCODE);
+  sensorSerial.write((uint8_t)(FPM_DEFAULT_ADDRESS >> 24));
+  sensorSerial.write((uint8_t)(FPM_DEFAULT_ADDRESS >> 16));
+  sensorSerial.write((uint8_t)(FPM_DEFAULT_ADDRESS >> 8));
+  sensorSerial.write((uint8_t)(FPM_DEFAULT_ADDRESS));
+  sensorSerial.write((uint8_t)FPM_COMMANDPACKET);
+  sensorSerial.write((uint8_t)(totalLen >> 8));
+  sensorSerial.write((uint8_t)(totalLen));
+
+  uint16_t sum = (uint16_t)FPM_COMMANDPACKET + (totalLen >> 8) + (totalLen & 0xFF);
+  for (uint8_t i = 0; i < sizeof(payload); i++) {
+    sensorSerial.write(payload[i]);
+    sum += payload[i];
+  }
+  sensorSerial.write((uint8_t)(sum >> 8));
+  sensorSerial.write((uint8_t)sum);
+
+  uint32_t deadline = millis() + FPM_DEFAULT_TIMEOUT;
+  uint8_t b;
+
+  uint16_t header = 0;
+  while (header != FPM_STARTCODE) {
+    if (!readSensorByte(&b, deadline)) return false;
+    header = (uint16_t)(header << 8) | b;
+  }
+
+  uint32_t addr = 0;
+  for (uint8_t i = 0; i < 4; i++) {
+    if (!readSensorByte(&b, deadline)) return false;
+    addr = (addr << 8) | b;
+  }
+  if (addr != FPM_DEFAULT_ADDRESS) return false;
+
+  if (!readSensorByte(&b, deadline)) return false;
+  uint8_t pktId = b;
+  if (pktId != FPM_ACKPACKET) return false;
+  uint16_t chksum = pktId;
+
+  uint16_t pktLen = 0;
+  for (uint8_t i = 0; i < 2; i++) {
+    if (!readSensorByte(&b, deadline)) return false;
+    pktLen = (uint16_t)(pktLen << 8) | b;
+  }
+  chksum = (uint16_t)(chksum + (pktLen >> 8) + (pktLen & 0xFF));
+
+  // payload = 1 confirm-code byte + up to tableBufLen bitmap bytes
+  if (pktLen < 3 || (pktLen - 2) > (uint16_t)(tableBufLen + 1)) return false;
+
+  uint16_t payloadLen = pktLen - 2;
+  uint8_t confirmCode = 0xFF;
+  uint16_t written = 0;
+
+  for (uint16_t i = 0; i < payloadLen; i++) {
+    if (!readSensorByte(&b, deadline)) return false;
+    chksum = (uint16_t)(chksum + b);
+    if (i == 0) {
+      confirmCode = b;
+    } else if (written < tableBufLen) {
+      tableBuf[written++] = b;
+    }
+  }
+
+  uint16_t pktChksum = 0;
+  for (uint8_t i = 0; i < 2; i++) {
+    if (!readSensorByte(&b, deadline)) return false;
+    pktChksum = (uint16_t)(pktChksum << 8) | b;
+  }
+  if (pktChksum != chksum) return false;
+
+  return confirmCode == 0x00; // FPMStatus::OK
+}
+
 /* Reports back the ids of every currently-free (available) sensor slot, read
    directly off the sensor's own occupancy bitmap -- ground truth, independent
    of whatever the backend's database thinks is enrolled. Runs synchronously
    within pollForCommands(), same as DELETE/UPDATE (no menu interaction
    needed).
-
-   Relies on FPM::getIndexTable(), a small addition to the FPM library (see
-   fpm.h/fpm.cpp) -- the stock library only exposes getFreeIndex(), which
-   returns just the first free slot per page and discards the rest of the
-   occupancy bitmap it already parsed internally. getIndexTable() is the same
-   underlying sensor command (FPM_READTEMPLATEINDEX), just returning the raw
-   bitmap instead of stopping at the first zero bit.
 
    On success, acks with a custom payload -- {"status":"DONE","free_slot_ids":
    [...]} -- since the normal ackCommand() helper only carries a single
@@ -1409,14 +1523,12 @@ void handleListSlots(long commandId) {
   bool readError = false;
 
   for (uint16_t page = 0; page < pages; page++) {
-    uint16_t tableLen = sizeof(tableBuf);
-    FPMStatus st = finger.getIndexTable((uint8_t)page, tableBuf, &tableLen);
-    if (st != FPMStatus::OK) {
+    if (!readSensorIndexTable((uint8_t)page, tableBuf, sizeof(tableBuf))) {
       readError = true;
       break;
     }
 
-    for (uint16_t byteIdx = 0; byteIdx < tableLen; byteIdx++) {
+    for (uint16_t byteIdx = 0; byteIdx < sizeof(tableBuf); byteIdx++) {
       uint8_t group = tableBuf[byteIdx];
       for (uint8_t bit = 0; bit < 8; bit++) {
         uint16_t slotId = (page * FPM_TEMPLATES_PER_PAGE) + (byteIdx * 8) + bit;
