@@ -342,6 +342,14 @@ void drawClockStatic() {
   TFT_display.setTextColor(wifiOn ? TFT_GREEN : TFT_RED);
   TFT_display.print(wifiOn ? "ON" : "OFF");
 
+  // Firmware version, right-aligned on the same line as the Wi-Fi status.
+  char versionLine[8];
+  snprintf(versionLine, sizeof(versionLine), "V%s", FIRMWARE_VERSION);
+  int versionW = (int)strlen(versionLine) * 6 * 2; // font cell is ~6px wide at textSize 1
+  TFT_display.setTextColor(TFT_GRAY);
+  TFT_display.setCursor(TFT_display.width() - 10 - versionW, MENU_BANNER_H + 12);
+  TFT_display.print(versionLine);
+
   TFT_display.setTextColor(TFT_GRAY);
   TFT_display.setTextSize(2);
   TFT_display.setCursor(10, TFT_display.height() - 30);
