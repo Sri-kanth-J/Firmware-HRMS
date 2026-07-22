@@ -736,30 +736,21 @@ bool otaDownloadAndFlash(const String &assetApiUrl) {
   return true;
 }
 
-/* Core of the "Check Update" flow: queries the latest release on
-   OTA_GITHUB_REPO, compares its tag to FIRMWARE_VERSION, and if different,
-   downloads + flashes OTA_ASSET_NAME via otaDownloadAndFlash and reboots
-   into it.
+/* Outcome of querying GitHub for the latest release. Split out of
+   performOTAUpdate so the fetch/parse logic can be shared between the
+   remote-triggered path (applies unconditionally) and the manual "Check
+   Update" path (shows the version and asks for confirmation first). */
+enum OTAFetchStatus { OTA_FETCH_HTTP_ERROR, OTA_FETCH_BAD_JSON, OTA_FETCH_NO_RELEASE, OTA_FETCH_OK };
 
-   commandId: pass -1 for a local/manual check (menu item -- no ack sent).
-   Pass a real command ID when triggered remotely via the command queue (see
-   pollForCommands) so the backend gets a DONE/FAILED ack either way -- DONE
-   covers both "updated" and "already up to date", since both mean the
-   command completed successfully. The ack for a successful update is sent
-   just before ESP.restart() -- ackCommand() blocks until the POST completes,
-   so the backend hears back before the reboot happens. */
-void performOTAUpdate(long commandId) {
-  showStatus(STATUS_WIFI, "OTA", "Checking...");
+struct OTAReleaseInfo {
+  OTAFetchStatus status;
+  String version;
+  String assetUrl; // empty if this release has no asset named OTA_ASSET_NAME
+};
 
-  if (WiFi.status() != WL_CONNECTED) {
-    setAuraError();
-    showStatus(STATUS_ERROR, "OTA", "No WiFi");
-    beepError();
-    delay(1200);
-    setAuraIdle();
-    if (commandId >= 0) ackCommand(commandId, false, -1);
-    return;
-  }
+OTAReleaseInfo fetchLatestRelease() {
+  OTAReleaseInfo info;
+  info.status = OTA_FETCH_HTTP_ERROR;
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -783,13 +774,7 @@ void performOTAUpdate(long commandId) {
     // has no published (non-draft, non-prerelease) release yet.
     if (code > 0) Serial.println("[OTA] Response body: " + http.getString());
     http.end();
-    setAuraError();
-    showStatus(STATUS_ERROR, "OTA", "Check Failed");
-    beepError();
-    delay(1200);
-    setAuraIdle();
-    if (commandId >= 0) ackCommand(commandId, false, -1);
-    return;
+    return info;
   }
 
   // Filter keeps only the fields we need, to bound RAM use regardless of how
@@ -805,8 +790,131 @@ void performOTAUpdate(long commandId) {
 
   if (err) {
     Serial.print("[OTA] JSON parse error: "); Serial.println(err.c_str());
+    info.status = OTA_FETCH_BAD_JSON;
+    return info;
+  }
+
+  info.version = stripVersionPrefix(String((const char *)(doc["tag_name"] | "")));
+  if (info.version.length() == 0) {
+    info.status = OTA_FETCH_NO_RELEASE;
+    return info;
+  }
+
+  for (JsonObject asset : doc["assets"].as<JsonArray>()) {
+    if (String((const char *)(asset["name"] | "")) == OTA_ASSET_NAME) {
+      info.assetUrl = String((const char *)(asset["url"] | ""));
+      break;
+    }
+  }
+
+  info.status = OTA_FETCH_OK;
+  return info;
+}
+
+/* Yes/No confirmation screen shown by a manual "Check Update" when a newer
+   release is found. Reuses the rotary encoder purely as a two-way toggle
+   (rotate = swap the highlighted option, press = confirm whichever is
+   highlighted) -- kept separate from the main menu's state machine since
+   this blocks synchronously inside performOTAUpdate(), same as the
+   fingerprint prompts do. Always waits for the button to be released before
+   returning (rather than reacting on press, or distinguishing short/long
+   press) so no stale press-in-progress state leaks back into loop()'s own
+   long-press tracking once control returns to it. Defaults to "No" and
+   times out to "No" after OTA_CONFIRM_TIMEOUT_MS so an unattended device
+   never gets stuck here. */
+#define OTA_CONFIRM_TIMEOUT_MS 20000
+
+void drawOTAConfirm(const String &newVersion, bool yesSelected) {
+  TFT_display.fillScreen(TFT_WHITE);
+
+  TFT_display.fillRect(0, 0, TFT_display.width(), MENU_BANNER_H, TFT_VIOLET);
+  TFT_display.setTextColor(TFT_WHITE);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(10, 12);
+  TFT_display.print("Update Available");
+
+  TFT_display.setTextColor(TFT_BLACK);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(10, MENU_BANNER_H + 16);
+  TFT_display.print("Current: v");
+  TFT_display.print(FIRMWARE_VERSION);
+  TFT_display.setCursor(10, MENU_BANNER_H + 44);
+  TFT_display.print("New:     v");
+  TFT_display.print(newVersion);
+
+  TFT_display.setTextColor(TFT_GRAY);
+  TFT_display.setCursor(10, MENU_BANNER_H + 80);
+  TFT_display.print("Install this update?");
+
+  int y = MENU_BANNER_H + 118;
+  TFT_display.fillRect(10, y, 100, MENU_ITEM_H - 6, yesSelected ? TFT_CYAN : TFT_WHITE);
+  TFT_display.setTextColor(yesSelected ? TFT_BLACK : TFT_GRAY);
+  TFT_display.setCursor(32, y + 10);
+  TFT_display.print("Yes");
+
+  TFT_display.fillRect(130, y, 100, MENU_ITEM_H - 6, !yesSelected ? TFT_CYAN : TFT_WHITE);
+  TFT_display.setTextColor(!yesSelected ? TFT_BLACK : TFT_GRAY);
+  TFT_display.setCursor(152, y + 10);
+  TFT_display.print("No");
+
+  TFT_display.setTextColor(TFT_GRAY);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(10, TFT_display.height() - 56);
+  TFT_display.print("Turn: Choose");
+  TFT_display.setCursor(10, TFT_display.height() - 30);
+  TFT_display.print("Press: Confirm");
+}
+
+bool promptOTAConfirmation(const String &newVersion) {
+  bool yesSelected = false; // default to "No" -- an OTA flash isn't something to fall into by accident
+  int32_t lastDetent = readEncoderDetents();
+  drawOTAConfirm(newVersion, yesSelected);
+
+  uint32_t start = millis();
+  while (millis() - start < OTA_CONFIRM_TIMEOUT_MS) {
+    int32_t detents = readEncoderDetents();
+    if (detents != lastDetent) {
+      lastDetent = detents;
+      yesSelected = !yesSelected; // only two options -- any rotation toggles between them
+      drawOTAConfirm(newVersion, yesSelected);
+    }
+
+    noInterrupts();
+    buttonDownFlag = false; // consumed here so it can't be mistaken for a fresh press once we return
+    bool upFlag = buttonUpFlag;
+    buttonUpFlag = false;
+    interrupts();
+
+    if (upFlag) return yesSelected;
+
+    delay(5);
+  }
+
+  return false; // timed out -> treat as "No"
+}
+
+/* Core of the "Check Update" flow: queries the latest release on
+   OTA_GITHUB_REPO, compares its tag to FIRMWARE_VERSION, and if different,
+   downloads + flashes OTA_ASSET_NAME via otaDownloadAndFlash and reboots
+   into it.
+
+   commandId: pass -1 for a local/manual check (menu item -- no ack sent). If
+   that check finds a newer version, it's shown on screen via
+   promptOTAConfirmation() and the update only proceeds if the user confirms.
+   Pass a real command ID when triggered remotely via the command queue (see
+   pollForCommands) -- the backend/admin already decided to push this update,
+   so it's applied unconditionally (no confirmation prompt), and the backend
+   gets a DONE/FAILED ack either way -- DONE covers both "updated" and
+   "already up to date", since both mean the command completed successfully.
+   The ack for a successful update is sent just before ESP.restart() --
+   ackCommand() blocks until the POST completes, so the backend hears back
+   before the reboot happens. */
+void performOTAUpdate(long commandId) {
+  showStatus(STATUS_WIFI, "OTA", "Checking...");
+
+  if (WiFi.status() != WL_CONNECTED) {
     setAuraError();
-    showStatus(STATUS_ERROR, "OTA", "Bad Reply");
+    showStatus(STATUS_ERROR, "OTA", "No WiFi");
     beepError();
     delay(1200);
     setAuraIdle();
@@ -814,10 +922,13 @@ void performOTAUpdate(long commandId) {
     return;
   }
 
-  String remoteVersion = stripVersionPrefix(String((const char *)(doc["tag_name"] | "")));
-  if (remoteVersion.length() == 0) {
+  OTAReleaseInfo release = fetchLatestRelease();
+  if (release.status != OTA_FETCH_OK) {
+    const char *failLabel = (release.status == OTA_FETCH_BAD_JSON) ? "Bad Reply"
+                           : (release.status == OTA_FETCH_NO_RELEASE) ? "No Release"
+                           : "Check Failed";
     setAuraError();
-    showStatus(STATUS_ERROR, "OTA", "No Release");
+    showStatus(STATUS_ERROR, "OTA", failLabel);
     beepError();
     delay(1200);
     setAuraIdle();
@@ -825,7 +936,7 @@ void performOTAUpdate(long commandId) {
     return;
   }
 
-  if (remoteVersion == FIRMWARE_VERSION) {
+  if (release.version == FIRMWARE_VERSION) {
     setAuraSuccess();
     showStatus(STATUS_OK, "OTA", "Up To Date");
     delay(1200);
@@ -834,15 +945,7 @@ void performOTAUpdate(long commandId) {
     return;
   }
 
-  String assetUrl;
-  for (JsonObject asset : doc["assets"].as<JsonArray>()) {
-    if (String((const char *)(asset["name"] | "")) == OTA_ASSET_NAME) {
-      assetUrl = String((const char *)(asset["url"] | ""));
-      break;
-    }
-  }
-
-  if (assetUrl.length() == 0) {
+  if (release.assetUrl.length() == 0) {
     setAuraError();
     showStatus(STATUS_ERROR, "OTA", "No Asset");
     beepError();
@@ -852,8 +955,19 @@ void performOTAUpdate(long commandId) {
     return;
   }
 
+  // An update is available. Remote-triggered (commandId >= 0) commands were
+  // already decided by the backend/admin, so apply unconditionally; a local
+  // "Check Update" menu press (commandId == -1) shows the new version and
+  // waits here for the user to confirm before touching the flash.
+  if (commandId < 0 && !promptOTAConfirmation(release.version)) {
+    showStatus(STATUS_WIFI, "OTA", "Skipped");
+    delay(900);
+    setAuraIdle();
+    return;
+  }
+
   showStatus(STATUS_WIFI, "OTA", "Downloading");
-  bool ok = otaDownloadAndFlash(assetUrl);
+  bool ok = otaDownloadAndFlash(release.assetUrl);
 
   if (ok) {
     setAuraSuccess();
