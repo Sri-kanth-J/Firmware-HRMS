@@ -60,7 +60,7 @@ bool shouldSaveConfig = false;
 // actually watching for that press.
 bool configPortalCancellable = false;
 
-WiFiClient secureClient;
+WiFiClientSecure secureClient;
 
 #define HTTP_CONNECT_TIMEOUT_MS 8000
 #define HTTP_RESPONSE_TIMEOUT_MS 8000
@@ -1703,6 +1703,8 @@ void doRestart() {
 /* ---------------- Arduino lifecycle ---------------- */
 void setup() {
   Serial.begin(115200);
+
+  secureClient.setInsecure(); // no cert pinning -- backend host may not use a CA in the ESP32's trust store
 
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
