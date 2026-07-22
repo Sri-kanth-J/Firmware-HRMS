@@ -1372,6 +1372,98 @@ void handleRemoteDelete(long commandId, long targetSlot) {
   ackCommand(commandId, ok, -1);
 }
 
+/* Reports back the ids of every currently-free (available) sensor slot, read
+   directly off the sensor's own occupancy bitmap -- ground truth, independent
+   of whatever the backend's database thinks is enrolled. Runs synchronously
+   within pollForCommands(), same as DELETE/UPDATE (no menu interaction
+   needed).
+
+   Relies on FPM::getIndexTable(), a small addition to the FPM library (see
+   fpm.h/fpm.cpp) -- the stock library only exposes getFreeIndex(), which
+   returns just the first free slot per page and discards the rest of the
+   occupancy bitmap it already parsed internally. getIndexTable() is the same
+   underlying sensor command (FPM_READTEMPLATEINDEX), just returning the raw
+   bitmap instead of stopping at the first zero bit.
+
+   On success, acks with a custom payload -- {"status":"DONE","free_slot_ids":
+   [...]} -- since the normal ackCommand() helper only carries a single
+   result_slot_id, not an array. Any failure (sensor missing, or a page read
+   error partway through) falls back to the plain ackCommand(id, false, -1),
+   discarding whatever was collected so far -- callers should treat a FAILED
+   LIST_SLOTS as "try again", not "the sensor is empty". */
+void handleListSlots(long commandId) {
+  if (!sensorReady && !initFingerprintSensor()) {
+    ackCommand(commandId, false, -1);
+    return;
+  }
+
+  showStatus(STATUS_WIFI, "Slots", "Reading...");
+
+  uint16_t capacity = haveParams ? params.capacity : 200;
+  uint16_t pages = (capacity / FPM_TEMPLATES_PER_PAGE) + 1;
+
+  DynamicJsonDocument doc(4096);
+  JsonArray freeSlots = doc.createNestedArray("free_slot_ids");
+
+  uint8_t tableBuf[FPM_TEMPLATES_PER_PAGE / 8]; // 1 bit per slot, 8 slots/byte
+  bool readError = false;
+
+  for (uint16_t page = 0; page < pages; page++) {
+    uint16_t tableLen = sizeof(tableBuf);
+    FPMStatus st = finger.getIndexTable((uint8_t)page, tableBuf, &tableLen);
+    if (st != FPMStatus::OK) {
+      readError = true;
+      break;
+    }
+
+    for (uint16_t byteIdx = 0; byteIdx < tableLen; byteIdx++) {
+      uint8_t group = tableBuf[byteIdx];
+      for (uint8_t bit = 0; bit < 8; bit++) {
+        uint16_t slotId = (page * FPM_TEMPLATES_PER_PAGE) + (byteIdx * 8) + bit;
+        if (slotId >= capacity) break; // don't report past the sensor's real capacity
+        bool occupied = (group & (1 << bit)) != 0;
+        if (!occupied) freeSlots.add(slotId);
+      }
+    }
+  }
+
+  if (readError) {
+    setAuraError();
+    showStatus(STATUS_ERROR, "Slots", "Read Failed");
+    beepError();
+    delay(1200);
+    setAuraIdle();
+    ackCommand(commandId, false, -1);
+    return;
+  }
+
+  doc["status"] = "DONE";
+
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  String url = baseUrl + "/api/devices/commands/" + String(commandId) + "/ack";
+  http.begin(secureClient, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", deviceApiKey);
+  http.addHeader("X-Device-Secret", deviceApiSecret);
+
+  String payload;
+  serializeJson(doc, payload);
+  int code = http.POST(payload);
+  Serial.print("[LIST_SLOTS] Command "); Serial.print(commandId);
+  Serial.print(" -> status code "); Serial.println(code);
+  http.end();
+
+  setAuraSuccess();
+  char countLine[24];
+  snprintf(countLine, sizeof(countLine), "%u free", (unsigned)freeSlots.size());
+  showStatus(STATUS_OK, "Slots", countLine);
+  beepSuccess();
+  delay(1200);
+  setAuraIdle();
+}
+
 void pollForCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -1410,6 +1502,8 @@ void pollForCommands() {
     queuePendingEnroll(commandId, employeeId);
   } else if (commandType == "UPDATE") {
     performOTAUpdate(commandId);
+  } else if (commandType == "LIST_SLOTS") {
+    handleListSlots(commandId);
   }
 }
 
