@@ -67,9 +67,10 @@ WiFiClientSecure secureClient;
 /* ---------------- Backend endpoints (body-based auth: every request carries
    deviceId/keySecret in its JSON body, not headers) ---------------- */
 #define BACKEND_TENANT "ASDistributors" // compile-time tenant slug, same pattern as OTA_GITHUB_OWNER/REPO above
-#define EP_CREATE_ENROLLMENT            "/createEnrollment/" BACKEND_TENANT
+#define EP_CREATE_ENROLLMENT            "/createEnrollment/" BACKEND_TENANT // device registration only -- see enrollEmployee()'s comment for why employee enrollment uses a different endpoint
 #define EP_EMPLOYEES_WITHOUT_ENROLLMENT "/getEmployeesWithoutEnrollment/" BACKEND_TENANT
 #define EP_SYNC_PUNCH_ENTRIES           "/SyncDevicePunchEntries/" BACKEND_TENANT
+#define EP_UPDATE_EMPLOYEE_SLOT         "/updateEmployeeSlotId/" BACKEND_TENANT
 
 /* Punch buffer: local fingerprint matches accumulate here instead of hitting
    the backend immediately (see appendPunch()/syncPunchBuffer()), POSTed in
@@ -1292,6 +1293,18 @@ String formatIso8601Utc(uint32_t utcEpoch) {
   return String(buf);
 }
 
+/* createEnrollment and SyncDevicePunchEntries both respond HTTP 200 even on
+   failure (confirmed live: a duplicate device registration came back 200
+   with {"notifier":"error","message":"Enrollment Already Exists"}) -- the
+   real result is only in the body's "notifier" field. Every caller that
+   cares about success/failure must check this, not just the HTTP status. */
+bool bodyNotifierIsSuccess(const String &body) {
+  DynamicJsonDocument doc(256);
+  if (deserializeJson(doc, body)) return false;
+  String notifier = String((const char *)(doc["notifier"] | ""));
+  return notifier == "success";
+}
+
 /* Registers this device with the backend. Attempted once at boot and
    retried from loop() until it succeeds; result persisted so it only ever
    needs to happen once per device lifetime. */
@@ -1311,19 +1324,32 @@ bool registerDeviceIfNeeded() {
   http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(payload);
+  String body = (code == 200) ? http.getString() : String("");
   http.end();
 
-  Serial.print("[REGISTER] status code "); Serial.println(code);
-  if (code == 200) {
-    deviceRegistered = true;
-    saveRegisteredFlag();
-    // Seed the "Enrolls (N)" badge immediately rather than waiting up to
-    // ENROLL_LIST_REFRESH_INTERVAL_MS for the first background refresh.
-    fetchEmployeesWithoutEnrollment();
-    lastEnrollListRefreshMs = millis();
-    return true;
-  }
-  return false;
+  Serial.print("[REGISTER] status "); Serial.print(code);
+  Serial.print(" body: "); Serial.println(body);
+
+  bool ok = (code == 200) && bodyNotifierIsSuccess(body);
+  // Treat "already exists" as success too, not just a literal notifier
+  // "success" -- otherwise a device that's already known to the backend
+  // (re-flashed firmware, NVS erased, pre-provisioned before shipping)
+  // would retry forever and never reach the "registered" state that
+  // enrollment-fetch/punch-sync are gated on. Tradeoff: a genuinely WRONG
+  // keySecret for an existing deviceId looks identical to this from the
+  // response alone, so it gets accepted here too -- the backend would need
+  // to return a distinct error to tell those apart.
+  if (!ok && body.indexOf("Already Exists") >= 0) ok = true;
+
+  if (!ok) return false;
+
+  deviceRegistered = true;
+  saveRegisteredFlag();
+  // Seed the "Enrolls (N)" badge immediately rather than waiting up to
+  // ENROLL_LIST_REFRESH_INTERVAL_MS for the first background refresh.
+  fetchEmployeesWithoutEnrollment();
+  lastEnrollListRefreshMs = millis();
+  return true;
 }
 
 /* Flushes the punch buffer in one all-or-nothing bulk POST -- the backend
@@ -1334,7 +1360,15 @@ bool syncPunchBuffer() {
   if (!deviceRegistered) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  DynamicJsonDocument doc(4096);
+  // Sized generously for a full PUNCH_BUFFER_CAPACITY (30) batch -- confirmed
+  // live that 30 entries serialize to ~1.6KB of raw JSON, but ArduinoJson's
+  // internal per-object/array overhead runs well above raw text size for
+  // many small objects like these (30 objects x 2 fields each), so building
+  // toward a tight budget risks silent truncation right at the one moment
+  // (a full buffer) this whole feature exists for. RAM is abundant here
+  // (this is a transient allocation against ~276KB free), so there's no
+  // reason to cut this close.
+  DynamicJsonDocument doc(8192);
   doc["deviceId"] = deviceId;
   doc["keySecret"] = keySecret;
   JsonArray entries = doc.createNestedArray("entries");
@@ -1357,12 +1391,7 @@ bool syncPunchBuffer() {
 
   Serial.print("[PUNCH SYNC] status code "); Serial.println(code);
 
-  if (code != 200) return false;
-
-  DynamicJsonDocument respDoc(256);
-  if (deserializeJson(respDoc, body)) return false;
-  String notifier = String((const char *)(respDoc["notifier"] | ""));
-  if (notifier != "success") return false;
+  if (code != 200 || !bodyNotifierIsSuccess(body)) return false;
 
   punchBufferCount = 0;
   savePunchBuffer();
@@ -1415,7 +1444,10 @@ bool fetchEmployeesWithoutEnrollment() {
   Serial.print("[ENROLL LIST] status code "); Serial.println(code);
   if (code != 200) return false;
 
-  DynamicJsonDocument doc(4096);
+  // Same overhead reasoning as syncPunchBuffer()'s doc -- sized generously
+  // for a full MAX_EMPLOYEE_LIST (40) entries, each with a name string of
+  // unknown real-world length, rather than cutting a parse budget close.
+  DynamicJsonDocument doc(8192);
   if (deserializeJson(doc, body)) return false;
 
   for (JsonObject emp : doc.as<JsonArray>()) {
@@ -1427,29 +1459,49 @@ bool fetchEmployeesWithoutEnrollment() {
   return true;
 }
 
-/* Registers a captured fingerprint slot against an employee. */
+/* Registers a captured fingerprint slot against an employee.
+
+   NOT createEnrollment -- confirmed live against the real backend that
+   employee records are pre-created elsewhere (e.g. an HR admin flow), which
+   is why they show up in getEmployeesWithoutEnrollment in the first place;
+   calling createEnrollment(type=employee) for one of them fails with
+   "Enrollment Already Exists" since the record already exists. This
+   endpoint is the correct one for attaching the slot the device just
+   captured. Also confirmed live: an employee can only be assigned a slot
+   ONCE -- a second call for an already-assigned employee is rejected
+   ("Employee is already assigned to a slot") regardless of the slotId
+   given, so this isn't reusable to reassign someone to a different slot.
+
+   deviceId is REQUIRED here, not just for consistency with the other
+   endpoints -- confirmed live that the slot<->employee mapping is scoped
+   per device. A slot assigned via this call WITHOUT deviceId is silently
+   unusable: it still removes the employee from getEmployeesWithoutEnrollment
+   (so it looks like it worked), but SyncDevicePunchEntries later fails with
+   "No employees found" for that slot, because there's no device association
+   to resolve it against. Omitting this field is the single easiest way to
+   silently break the whole enrollment -> punch-sync chain. */
 bool enrollEmployee(long employeeId, uint16_t slotId) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  DynamicJsonDocument doc(256);
-  doc["deviceId"] = deviceId;
-  doc["keySecret"] = keySecret;
+  DynamicJsonDocument doc(128);
   doc["employeeId"] = employeeId;
   doc["slotId"] = slotId;
-  doc["type"] = "employee";
+  doc["deviceId"] = deviceId;
   String payload;
   serializeJson(doc, payload);
 
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT);
+  http.begin(secureClient, baseUrl + EP_UPDATE_EMPLOYEE_SLOT);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(payload);
+  String body = (code == 200) ? http.getString() : String("");
   http.end();
 
-  Serial.print("[ENROLL EMPLOYEE] status code "); Serial.println(code);
-  return code == 200;
+  Serial.print("[ENROLL EMPLOYEE] status "); Serial.print(code);
+  Serial.print(" body: "); Serial.println(body);
+  return code == 200 && bodyNotifierIsSuccess(body);
 }
 
 /* ---------------- Legacy command-ack (dead code, kept for compilation) ----------------
