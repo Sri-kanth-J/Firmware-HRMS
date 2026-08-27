@@ -89,12 +89,20 @@ unsigned long lastPunchSyncMs = 0;
 
 bool deviceRegistered = false; // mirrors NVS "registered" -- gates enroll-fetch and punch-sync until createEnrollment(device) succeeds
 
-/* Employees pending fingerprint enrollment, fetched on demand when the
-   "Enrolls" menu item is opened (see doEnroll()/fetchEmployeesWithoutEnrollment()). */
+/* Employees pending fingerprint enrollment. Fetched fresh whenever the
+   "Enrolls" menu item is opened (see doEnroll()), and also refreshed
+   periodically in the background (see loop()) purely so the "Enrolls (N)"
+   badge on the main menu (drawMenuItem()) stays reasonably current without
+   requiring the menu to be opened -- refreshing on every menu redraw would
+   mean a blocking network call on every encoder tick, exactly the kind of
+   weak-Wi-Fi stall this whole feature exists to avoid. */
 #define MAX_EMPLOYEE_LIST 40
 long employeeListIds[MAX_EMPLOYEE_LIST];
 String employeeListNames[MAX_EMPLOYEE_LIST];
 uint8_t employeeListCount = 0;
+
+#define ENROLL_LIST_REFRESH_INTERVAL_MS 60000 // less time-sensitive than punch sync -- just a UI count
+unsigned long lastEnrollListRefreshMs = 0;
 
 /* 2.8" TFT SPI pins -- same wiring as the DIYables reference sketch.
    MOSI/SCK/MISO use the ESP32's default hardware (VSPI) pins: 23/18/19. */
@@ -322,6 +330,11 @@ void drawMenuItem(uint8_t i) {
   TFT_display.setTextSize(2);
   TFT_display.setCursor(16, y + 10);
   TFT_display.print(menuItems[i]);
+  if (i == 1) {
+    TFT_display.print(" (");
+    TFT_display.print(employeeListCount);
+    TFT_display.print(")");
+  }
 }
 
 void drawMenu() {
@@ -1304,6 +1317,10 @@ bool registerDeviceIfNeeded() {
   if (code == 200) {
     deviceRegistered = true;
     saveRegisteredFlag();
+    // Seed the "Enrolls (N)" badge immediately rather than waiting up to
+    // ENROLL_LIST_REFRESH_INTERVAL_MS for the first background refresh.
+    fetchEmployeesWithoutEnrollment();
+    lastEnrollListRefreshMs = millis();
     return true;
   }
   return false;
@@ -1492,6 +1509,9 @@ void drawEnrollListItem(uint8_t visibleRow, uint8_t dataIndex, bool selected) {
   TFT_display.setTextSize(2);
   TFT_display.setCursor(16, y + 10);
   TFT_display.print(employeeListNames[dataIndex]);
+  TFT_display.print("(");
+  TFT_display.print(employeeListIds[dataIndex]);
+  TFT_display.print(")");
 }
 
 /* scrollOffset shifts which window of ENROLL_LIST_VISIBLE_ROWS is on screen --
@@ -1578,6 +1598,7 @@ void doEnroll() {
 
   setAuraProcessing();
   showStatus(STATUS_WIFI, "Enrolls", "Loading...");
+  lastEnrollListRefreshMs = millis(); // this counts as a refresh -- no need for the background timer to repeat it right away
   if (!fetchEmployeesWithoutEnrollment()) {
     setAuraError();
     showStatus(STATUS_ERROR, "Enrolls", "Fetch Failed");
@@ -1872,10 +1893,14 @@ void loop() {
     }
   }
 
-  // ---- Background: device registration retry + punch-buffer flush ----
-  // Never touches the TFT (unlike the old pollForCommands() background poll) --
-  // the only screen touch in this whole path is appendPunch()'s "Buffer Full"
-  // message, which only fires synchronously from doLogin() itself.
+  // ---- Background: device registration retry, punch-buffer flush, enroll-list refresh ----
+  // At most one blocking HTTP call per tick, in priority order: registration
+  // first (nothing else works until it succeeds), then punch sync (data-loss
+  // risk), then the enroll-list refresh (just a UI count, lowest priority
+  // and its own longer interval). Only the enroll-list refresh redraws the
+  // TFT (to update the "Enrolls (N)" badge if the menu happens to be open) --
+  // registration/punch-sync never touch the screen; the only screen touch
+  // outside this block is appendPunch()'s "Buffer Full" message.
   if (millis() - lastPunchSyncMs > PUNCH_SYNC_INTERVAL_MS) {
     lastPunchSyncMs = millis();
     if (WiFi.status() == WL_CONNECTED) {
@@ -1883,6 +1908,9 @@ void loop() {
         registerDeviceIfNeeded();
       } else if (punchBufferCount > 0) {
         syncPunchBuffer();
+      } else if (millis() - lastEnrollListRefreshMs > ENROLL_LIST_REFRESH_INTERVAL_MS) {
+        lastEnrollListRefreshMs = millis();
+        if (fetchEmployeesWithoutEnrollment() && appState == STATE_MENU) drawMenu();
       }
     }
   }
