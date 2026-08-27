@@ -16,19 +16,20 @@
    saved to flash. After that, these are overridden by whatever was entered
    through the "Device Setup" captive portal (WiFiManager) and persisted to
    NVS. Keep these as the values for a brand-new, unconfigured unit. */
-#define DEFAULT_BASE_URL "base-url"
-#define DEFAULT_API_KEY "api-key"
-#define DEFAULT_API_SECRET "api-secret"
+#define DEFAULT_BASE_URL "https://example.com/api"
+#define DEFAULT_DEVICE_ID "device-id"
+#define DEFAULT_KEY_SECRET "key-secret"
 
 /* ---------------- Firmware / OTA update config ----------------
    FIRMWARE_VERSION must match the GitHub Release tag (a leading "v" is
    stripped before comparing) for the device to consider itself up to date.
    To ship an update: bump this, push a tag matching it (e.g. "v0.2") to
    OTA_GITHUB_OWNER/OTA_GITHUB_REPO, and CI builds + attaches OTA_ASSET_NAME
-   to the release. Devices check either when "Check Update" is selected from
-   the menu (see checkForOTAUpdate()), or when the backend queues an
-   "UPDATE" command (see pollForCommands() / performOTAUpdate()) -- there's
-   no periodic background check initiated by the device itself.
+   to the release. Devices check only when "Check Update" is selected from
+   the menu (see checkForOTAUpdate() / performOTAUpdate()) -- there's no
+   periodic background check, and no remote-triggered update path (the old
+   backend command queue that used to push an "UPDATE" command was removed
+   along with the rest of that subsystem -- see ackCommand()'s comment).
 
    NOTE: OTA_GITHUB_REPO is private, so every device carries GITHUB_PAT
    (from secrets.h) to read it. Scope that token to read-only "Contents"
@@ -46,11 +47,9 @@
    password (WiFiManager stores those itself), while "Configure Backend"
    handles the fields below, added as custom parameters on their own portal
    page (via setParamsPage) and persisted here ourselves. */
-String deviceApiKey;
-String deviceApiSecret;
-String baseUrl;
-String serverUrl;
-String commandsNextUrl;
+String deviceId;
+String keySecret;
+String baseUrl; // must include the "/api" suffix -- endpoints are baseUrl + "/createEnrollment/..." etc.
 
 Preferences prefs;
 bool shouldSaveConfig = false;
@@ -65,15 +64,37 @@ WiFiClientSecure secureClient;
 #define HTTP_CONNECT_TIMEOUT_MS 8000
 #define HTTP_RESPONSE_TIMEOUT_MS 8000
 
-/* Remote command queue: the backend queues ENROLL/DELETE/UPDATE commands (from the
-   HR/Admin portal) that this device polls for and executes. */
-#define POLL_INTERVAL_MS 20000
-unsigned long lastPollMs = 0;
+/* ---------------- Backend endpoints (body-based auth: every request carries
+   deviceId/keySecret in its JSON body, not headers) ---------------- */
+#define BACKEND_TENANT "ASDistributors" // compile-time tenant slug, same pattern as OTA_GITHUB_OWNER/REPO above
+#define EP_CREATE_ENROLLMENT            "/createEnrollment/" BACKEND_TENANT
+#define EP_EMPLOYEES_WITHOUT_ENROLLMENT "/getEmployeesWithoutEnrollment/" BACKEND_TENANT
+#define EP_SYNC_PUNCH_ENTRIES           "/SyncDevicePunchEntries/" BACKEND_TENANT
 
-#define MAX_PENDING_ENROLLS 5
-long pendingEnrollCommandIds[MAX_PENDING_ENROLLS];
-long pendingEnrollEmployeeIds[MAX_PENDING_ENROLLS];
-uint8_t pendingEnrollCount = 0;
+/* Punch buffer: local fingerprint matches accumulate here instead of hitting
+   the backend immediately (see appendPunch()/syncPunchBuffer()), POSTed in
+   bulk periodically or immediately once full. Persisted to NVS (not just
+   RAM) because performOTAUpdate() calls ESP.restart() on every firmware
+   update, which would otherwise silently wipe any unsynced punches. */
+#define PUNCH_BUFFER_CAPACITY 30
+struct PunchRecord {
+  uint16_t slotId;
+  uint32_t epochTime; // true UTC seconds since epoch -- see getUtcEpochNow()
+};
+PunchRecord punchBuffer[PUNCH_BUFFER_CAPACITY];
+uint8_t punchBufferCount = 0;
+
+#define PUNCH_SYNC_INTERVAL_MS 20000
+unsigned long lastPunchSyncMs = 0;
+
+bool deviceRegistered = false; // mirrors NVS "registered" -- gates enroll-fetch and punch-sync until createEnrollment(device) succeeds
+
+/* Employees pending fingerprint enrollment, fetched on demand when the
+   "Enrolls" menu item is opened (see doEnroll()/fetchEmployeesWithoutEnrollment()). */
+#define MAX_EMPLOYEE_LIST 40
+long employeeListIds[MAX_EMPLOYEE_LIST];
+String employeeListNames[MAX_EMPLOYEE_LIST];
+uint8_t employeeListCount = 0;
 
 /* 2.8" TFT SPI pins -- same wiring as the DIYables reference sketch.
    MOSI/SCK/MISO use the ESP32's default hardware (VSPI) pins: 23/18/19. */
@@ -301,11 +322,6 @@ void drawMenuItem(uint8_t i) {
   TFT_display.setTextSize(2);
   TFT_display.setCursor(16, y + 10);
   TFT_display.print(menuItems[i]);
-  if (i == 1) {
-    TFT_display.print(" (");
-    TFT_display.print(pendingEnrollCount);
-    TFT_display.print(")");
-  }
 }
 
 void drawMenu() {
@@ -514,30 +530,45 @@ int32_t readEncoderDetents() {
 }
 
 /* ---------------- Remote configuration ---------------- */
-/* Rebuilds the derived endpoint URLs any time baseUrl changes. */
-void deriveUrls() {
-  serverUrl = baseUrl + "/api/attendance";
-  commandsNextUrl = baseUrl + "/api/devices/commands/next";
-}
-
 /* Reads saved config from NVS, falling back to factory defaults the first
-   time the device ever boots (before anything has been saved). */
+   time the device ever boots (before anything has been saved). Also
+   restores the punch buffer and registration flag here, so both survive a
+   reboot (e.g. an OTA update's ESP.restart()). */
 void loadConfig() {
   prefs.begin("fpmcfg", true);
-  deviceApiKey = prefs.getString("apikey", DEFAULT_API_KEY);
-  deviceApiSecret = prefs.getString("apisecret", DEFAULT_API_SECRET);
+  deviceId = prefs.getString("deviceid", DEFAULT_DEVICE_ID);
+  keySecret = prefs.getString("keysecret", DEFAULT_KEY_SECRET);
   baseUrl = prefs.getString("baseurl", DEFAULT_BASE_URL);
+  deviceRegistered = prefs.getBool("registered", false);
+  punchBufferCount = prefs.getUChar("punchcnt", 0);
+  prefs.getBytes("punchbuf", punchBuffer, sizeof(punchBuffer));
   prefs.end();
-  deriveUrls();
 }
 
 void saveConfig() {
   prefs.begin("fpmcfg", false);
-  prefs.putString("apikey", deviceApiKey);
-  prefs.putString("apisecret", deviceApiSecret);
+  prefs.putString("deviceid", deviceId);
+  prefs.putString("keysecret", keySecret);
   prefs.putString("baseurl", baseUrl);
   prefs.end();
   Serial.println("[CONFIG] Saved device config to NVS");
+}
+
+/* Persists the punch buffer as a single fixed-size blob (always the full
+   PUNCH_BUFFER_CAPACITY worth, ~180 bytes) -- simpler and no worse on NVS's
+   wear budget than a variably-sized write, and cheaper than one NVS entry
+   per record. Called on every append and every successful sync. */
+void savePunchBuffer() {
+  prefs.begin("fpmcfg", false);
+  prefs.putUChar("punchcnt", punchBufferCount);
+  prefs.putBytes("punchbuf", punchBuffer, sizeof(punchBuffer));
+  prefs.end();
+}
+
+void saveRegisteredFlag() {
+  prefs.begin("fpmcfg", false);
+  prefs.putBool("registered", deviceRegistered);
+  prefs.end();
 }
 
 void saveConfigCallback() {
@@ -586,7 +617,7 @@ void configPortalStartedCallback(WiFiManager *wmPtr) {
 /* Single portal, two menu entries: connecting to the "Device-Setup" access
    point opens one WiFiManager captive portal whose root page offers
    "Configure WiFi" (native SSID/password page) and "Configure Backend" (our
-   Device API Key / Device API Secret / Backend Base URL fields, on their own
+   Device ID / Device Key Secret / Backend Base URL fields, on their own
    page via setParamsPage so they never show up on the Wi-Fi page). Either,
    both, or neither can be filled in during the same session.
 
@@ -602,11 +633,11 @@ bool runConfigPortal(bool forcePortal) {
   wm.setAPCallback(configPortalStartedCallback);
   wm.setConfigPortalTimeout(180); // give up and continue offline after 3 min unattended
 
-  WiFiManagerParameter custom_apikey("apikey", "Device API Key", deviceApiKey.c_str(), 40);
-  WiFiManagerParameter custom_apisecret("apisecret", "Device API Secret", deviceApiSecret.c_str(), 64);
-  WiFiManagerParameter custom_baseurl("baseurl", "Backend Base URL", baseUrl.c_str(), 80);
-  wm.addParameter(&custom_apikey);
-  wm.addParameter(&custom_apisecret);
+  WiFiManagerParameter custom_deviceid("deviceid", "Device ID", deviceId.c_str(), 40);
+  WiFiManagerParameter custom_keysecret("keysecret", "Device Key Secret", keySecret.c_str(), 64);
+  WiFiManagerParameter custom_baseurl("baseurl", "Backend Base URL (include /api)", baseUrl.c_str(), 80);
+  wm.addParameter(&custom_deviceid);
+  wm.addParameter(&custom_keysecret);
   wm.addParameter(&custom_baseurl);
 
   wm.setParamsPage(true); // keep the backend fields off the Wi-Fi page, on their own page instead
@@ -654,10 +685,9 @@ bool runConfigPortal(bool forcePortal) {
   // Backend fields are only in play if the "Configure Backend" page was used --
   // check that regardless of whether Wi-Fi itself was touched this session.
   if (shouldSaveConfig) {
-    deviceApiKey = String(custom_apikey.getValue());
-    deviceApiSecret = String(custom_apisecret.getValue());
+    deviceId = String(custom_deviceid.getValue());
+    keySecret = String(custom_keysecret.getValue());
     baseUrl = String(custom_baseurl.getValue());
-    deriveUrls();
     saveConfig();
   }
 
@@ -961,14 +991,15 @@ bool promptOTAConfirmation(const String &newVersion) {
    downloads + flashes OTA_ASSET_NAME via otaDownloadAndFlash and reboots
    into it.
 
-   commandId: pass -1 for a local/manual check (menu item -- no ack sent). If
-   that check finds a newer version, it's shown on screen via
-   promptOTAConfirmation() and the update only proceeds if the user confirms.
-   Pass a real command ID when triggered remotely via the command queue (see
-   pollForCommands) -- the backend/admin already decided to push this update,
-   so it's applied unconditionally (no confirmation prompt), and the backend
-   gets a DONE/FAILED ack either way -- DONE covers both "updated" and
-   "already up to date", since both mean the command completed successfully.
+   commandId: always -1 now -- the only remaining caller is the local/manual
+   "Check Update" menu item, which shows the new version on screen via
+   promptOTAConfirmation() and only proceeds if the user confirms. This used
+   to also support commandId >= 0 for a remote-triggered update pushed
+   through the old backend's command queue (applied unconditionally, with a
+   DONE/FAILED ack sent back); that trigger path was removed along with the
+   rest of the command-queue subsystem (see ackCommand()'s comment), but the
+   commandId >= 0 branches below are left in place since they're harmless
+   dead code and this function is otherwise unrelated to that change.
    The ack for a successful update is sent just before ESP.restart() --
    ackCommand() blocks until the POST completes, so the backend hears back
    before the reboot happens. */
@@ -1218,101 +1249,202 @@ bool captureAndStoreTemplate(uint16_t *outSlot) {
   return true;
 }
 
-void sendAttendanceLog(uint16_t id, uint16_t score) {
-  if (WiFi.status() != WL_CONNECTED) {
-    quickReconnectWiFi();
-  }
+/* ---------------- Backend sync: registration, enrollment, punch buffer ----------------
+   Auth on every call below is body-based: {"deviceId":...,"keySecret":...}
+   merged into each request's JSON, no custom headers. */
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[HTTP] Cannot send payload: Wi-Fi Disconnected!");
-    setAuraError();
-    showStatus(STATUS_ERROR, "Network", "Offline");
-    beepError();
-    delay(900);
-    setAuraIdle();
-    return;
-  }
+/* True UTC seconds since epoch. NOTE: on ESP32 Arduino, configTime()'s
+   gmtOffset_sec bakes the offset directly into the system clock itself, so
+   time(nullptr) returns the already-IST-shifted value (unlike standard
+   POSIX, where time() is timezone-agnostic and only localtime() applies an
+   offset) -- confirmed against known ESP32 Arduino core behavior. Subtract
+   the offset back out here, once, to recover true UTC for the backend.
+   syncTimeIfNeeded()/configTime() and the on-screen IST clock are untouched. */
+uint32_t getUtcEpochNow() {
+  return (uint32_t)(time(nullptr) - IST_OFFSET_SEC);
+}
+
+/* ISO8601 UTC, e.g. "2026-08-27T17:06:24.000Z". Milliseconds are a fixed
+   placeholder, not real sub-second capture -- a fingerprint scan takes well
+   over a second, so same-second collisions aren't a realistic concern, and
+   real ms precision would cost an extra buffer byte for no practical gain. */
+String formatIso8601Utc(uint32_t utcEpoch) {
+  time_t t = (time_t)utcEpoch;
+  struct tm tmUtc;
+  gmtime_r(&t, &tmUtc);
+  char buf[25];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+           tmUtc.tm_year + 1900, tmUtc.tm_mon + 1, tmUtc.tm_mday,
+           tmUtc.tm_hour, tmUtc.tm_min, tmUtc.tm_sec);
+  return String(buf);
+}
+
+/* Registers this device with the backend. Attempted once at boot and
+   retried from loop() until it succeeds; result persisted so it only ever
+   needs to happen once per device lifetime. */
+bool registerDeviceIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  DynamicJsonDocument doc(256);
+  doc["deviceId"] = deviceId;
+  doc["keySecret"] = keySecret;
+  doc["type"] = "device";
+  String payload;
+  serializeJson(doc, payload);
 
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-
-  Serial.println("\n--- [HTTP POST START] ---");
-  Serial.print("[HTTP] Target URL: "); Serial.println(serverUrl);
-
-  http.begin(secureClient, serverUrl);
+  http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT);
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device-Key", deviceApiKey);
-  http.addHeader("X-Device-Secret", deviceApiSecret);
-
-  String payload = String("{\"fingerprint_id\":") + String(id) + ",\"score\":" + String(score) + "}";
-  Serial.print("[HTTP] Sending JSON Payload: "); Serial.println(payload);
-
   int code = http.POST(payload);
-  Serial.print("[HTTP] Response Status Code: "); Serial.println(code);
-
-  // 🌟 FIX: Only parse if the server explicitly confirms with HTTP 200 OK
-  if (code == 200) {
-    String serverResponse = http.getString(); 
-    Serial.print("[HTTP] Saved Response Data: "); Serial.println(serverResponse);
-
-    // 🌟 FIX: Stream string parsing optimization
-    if (serverResponse.indexOf("IN") >= 0) {
-      Serial.println("[UI] Match state found: Welcome User");
-      showStatus(STATUS_OK, "Welcome", "Logged IN");
-    } 
-    else if (serverResponse.indexOf("OUT") >= 0) {
-      Serial.println("[UI] Match state found: Goodbye User");
-      showStatus(STATUS_OK, "Goodbye", "Logged OUT");
-    } 
-    else {
-      Serial.println("[UI] Match state fallback: Generic Record");
-      showStatus(STATUS_OK, "Success", "Recorded");
-    }
-    setAuraSuccess();
-    beepSuccess();
-  } else {
-    // Catch-all block handles server errors safely without fake success screens
-    char codeLine[20];
-    snprintf(codeLine, sizeof(codeLine), "Code %d", code);
-    setAuraError();
-    showStatus(STATUS_ERROR, "Server Error", codeLine);
-    beepError();
-  }
-
   http.end();
-  Serial.println("--- [HTTP POST END] ---\n");
-  delay(1300);
-  setAuraIdle();
+
+  Serial.print("[REGISTER] status code "); Serial.println(code);
+  if (code == 200) {
+    deviceRegistered = true;
+    saveRegisteredFlag();
+    return true;
+  }
+  return false;
 }
 
-/* ---------------- Remote command queue ---------------- */
-/* Hand-rolled JSON field extraction (no ArduinoJson dependency) -- matches this
-   codebase's existing style of string-searching HTTP response bodies. Only works
-   against the flat, known response shapes returned by /devices/commands/next. */
-long extractJsonLong(const String &json, const char *key) {
-  String pattern = String("\"") + key + "\":";
-  int idx = json.indexOf(pattern);
-  if (idx < 0) return -1;
-  idx += pattern.length();
-  if (json.startsWith("null", idx)) return -1;
+/* Flushes the punch buffer in one all-or-nothing bulk POST -- the backend
+   gives no per-entry ack, so success clears the whole buffer and any
+   failure leaves it fully intact for the next attempt. */
+bool syncPunchBuffer() {
+  if (punchBufferCount == 0) return true;
+  if (!deviceRegistered) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
 
-  int end = idx;
-  while (end < (int)json.length() && (isDigit(json[end]) || json[end] == '-')) end++;
-  if (end == idx) return -1;
-  return json.substring(idx, end).toInt();
+  DynamicJsonDocument doc(4096);
+  doc["deviceId"] = deviceId;
+  doc["keySecret"] = keySecret;
+  JsonArray entries = doc.createNestedArray("entries");
+  for (uint8_t i = 0; i < punchBufferCount; i++) {
+    JsonObject e = entries.createNestedObject();
+    e["slotId"] = punchBuffer[i].slotId;
+    e["timestamp"] = formatIso8601Utc(punchBuffer[i].epochTime);
+  }
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.begin(secureClient, baseUrl + EP_SYNC_PUNCH_ENTRIES);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(payload);
+  String body = (code == 200) ? http.getString() : String("");
+  http.end();
+
+  Serial.print("[PUNCH SYNC] status code "); Serial.println(code);
+
+  if (code != 200) return false;
+
+  DynamicJsonDocument respDoc(256);
+  if (deserializeJson(respDoc, body)) return false;
+  String notifier = String((const char *)(respDoc["notifier"] | ""));
+  if (notifier != "success") return false;
+
+  punchBufferCount = 0;
+  savePunchBuffer();
+  return true;
 }
 
-String extractJsonString(const String &json, const char *key) {
-  String pattern = String("\"") + key + "\":\"";
-  int idx = json.indexOf(pattern);
-  if (idx < 0) return String("");
-  idx += pattern.length();
-  int end = json.indexOf("\"", idx);
-  if (end < 0) return String("");
-  return json.substring(idx, end);
+/* Buffers a punch locally -- instant, no network wait. If the buffer is
+   already full, one blocking sync is attempted right now; if that also
+   fails, the OLDEST record is evicted to make room. Evict-oldest (not
+   reject-newest) because rejecting the punch happening right now would
+   leave the person standing at the device with zero record and no
+   confirmation -- the worst outcome for the one person actually present.
+   This only triggers after PUNCH_BUFFER_CAPACITY unsynced punches AND a
+   live retry just failed, i.e. a sustained outage, not routine use. */
+void appendPunch(uint16_t slotId, uint32_t utcEpoch) {
+  if (punchBufferCount >= PUNCH_BUFFER_CAPACITY) {
+    showStatus(STATUS_WIFI, "Sync", "Buffer Full");
+    if (!syncPunchBuffer()) {
+      for (uint8_t i = 1; i < PUNCH_BUFFER_CAPACITY; i++) punchBuffer[i - 1] = punchBuffer[i];
+      punchBufferCount = PUNCH_BUFFER_CAPACITY - 1;
+      Serial.println("[PUNCH] Buffer full and sync failed -- evicted oldest record");
+    }
+  }
+  punchBuffer[punchBufferCount].slotId = slotId;
+  punchBuffer[punchBufferCount].epochTime = utcEpoch;
+  punchBufferCount++;
+  savePunchBuffer();
 }
 
+/* Fetches the list of employees still needing fingerprint enrollment. */
+bool fetchEmployeesWithoutEnrollment() {
+  employeeListCount = 0;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  DynamicJsonDocument reqDoc(256);
+  reqDoc["deviceId"] = deviceId;
+  reqDoc["keySecret"] = keySecret;
+  String payload;
+  serializeJson(reqDoc, payload);
+
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.begin(secureClient, baseUrl + EP_EMPLOYEES_WITHOUT_ENROLLMENT);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(payload);
+  String body = (code == 200) ? http.getString() : String("");
+  http.end();
+
+  Serial.print("[ENROLL LIST] status code "); Serial.println(code);
+  if (code != 200) return false;
+
+  DynamicJsonDocument doc(4096);
+  if (deserializeJson(doc, body)) return false;
+
+  for (JsonObject emp : doc.as<JsonArray>()) {
+    if (employeeListCount >= MAX_EMPLOYEE_LIST) break;
+    employeeListIds[employeeListCount] = emp["id"] | -1;
+    employeeListNames[employeeListCount] = String((const char *)(emp["name"] | ""));
+    employeeListCount++;
+  }
+  return true;
+}
+
+/* Registers a captured fingerprint slot against an employee. */
+bool enrollEmployee(long employeeId, uint16_t slotId) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  DynamicJsonDocument doc(256);
+  doc["deviceId"] = deviceId;
+  doc["keySecret"] = keySecret;
+  doc["employeeId"] = employeeId;
+  doc["slotId"] = slotId;
+  doc["type"] = "employee";
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(payload);
+  http.end();
+
+  Serial.print("[ENROLL EMPLOYEE] status code "); Serial.println(code);
+  return code == 200;
+}
+
+/* ---------------- Legacy command-ack (dead code, kept for compilation) ----------------
+   The old backend's command-queue subsystem (pollForCommands(), the ENROLL/
+   DELETE/LIST_SLOTS dispatch, extractJsonLong()/extractJsonString()) has
+   been removed along with that backend. This function's own endpoint
+   (baseUrl + "/api/devices/commands/<id>/ack") no longer exists either --
+   but performOTAUpdate() (untouched, still calls this in 5 places guarded
+   by `if (commandId >= 0)`) is the one caller left, and it only ever passes
+   commandId == -1 now (from checkForOTAUpdate() -> performOTAUpdate(-1)),
+   so those calls are permanently dead in practice. Deleting this function
+   would break that untouched OTA code, so it stays, unused. */
 void ackCommand(long commandId, bool success, long resultSlot) {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -1322,8 +1454,8 @@ void ackCommand(long commandId, bool success, long resultSlot) {
   String url = baseUrl + "/api/devices/commands/" + String(commandId) + "/ack";
   http.begin(secureClient, url);
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device-Key", deviceApiKey);
-  http.addHeader("X-Device-Secret", deviceApiSecret);
+  http.addHeader("X-Device-Key", deviceId);
+  http.addHeader("X-Device-Secret", keySecret);
 
   String payload;
   if (success) {
@@ -1338,315 +1470,163 @@ void ackCommand(long commandId, bool success, long resultSlot) {
   http.end();
 }
 
-void queuePendingEnroll(long commandId, long employeeId) {
-  for (uint8_t i = 0; i < pendingEnrollCount; i++) {
-    if (pendingEnrollCommandIds[i] == commandId) return; // already queued
-  }
-  if (pendingEnrollCount >= MAX_PENDING_ENROLLS) return;
-  pendingEnrollCommandIds[pendingEnrollCount] = commandId;
-  pendingEnrollEmployeeIds[pendingEnrollCount] = employeeId;
-  pendingEnrollCount++;
+/* ---------------- "Enrolls" menu: pull-list employee enrollment ----------------
+   Pull model, replacing the old push-command queue: the device now fetches
+   the pending list itself (fetchEmployeesWithoutEnrollment()) rather than
+   waiting for the backend to queue an ENROLL command. */
+#define ENROLL_LIST_VISIBLE_ROWS 4
+
+void drawEnrollListHeader() {
+  TFT_display.fillScreen(TFT_WHITE);
+  TFT_display.fillRect(0, 0, TFT_display.width(), MENU_BANNER_H, TFT_VIOLET);
+  TFT_display.setTextColor(TFT_WHITE);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(10, 12);
+  TFT_display.print("Select Employee");
 }
 
-void handleRemoteDelete(long commandId, long targetSlot) {
-  if (targetSlot < 0 || (!sensorReady && !initFingerprintSensor())) {
-    ackCommand(commandId, false, -1);
-    return;
-  }
-
-  FPMStatus st = finger.deleteTemplate((uint16_t)targetSlot, 1);
-  bool ok = (st == FPMStatus::OK);
-
-  if (ok) {
-    setAuraSuccess();
-    showStatus(STATUS_OK, "Deleted", "Slot removed");
-    beepSuccess();
-  } else {
-    setAuraError();
-    showStatus(STATUS_ERROR, "Delete", "Failed");
-    beepError();
-  }
-  delay(900);
-  setAuraIdle();
-
-  ackCommand(commandId, ok, -1);
+void drawEnrollListItem(uint8_t visibleRow, uint8_t dataIndex, bool selected) {
+  int y = MENU_START_Y + visibleRow * MENU_ITEM_H;
+  TFT_display.fillRect(0, y, TFT_display.width(), MENU_ITEM_H - 6, selected ? TFT_CYAN : TFT_WHITE);
+  TFT_display.setTextColor(selected ? TFT_BLACK : TFT_GRAY);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(16, y + 10);
+  TFT_display.print(employeeListNames[dataIndex]);
 }
 
-/* ---------------- Raw sensor slot-index read ----------------
-   The FPM library's public API only exposes getFreeIndex(), which returns
-   just the FIRST free slot per "page" and discards the rest of the
-   occupancy bitmap it parses internally (see the library's own fpm.cpp) --
-   there's no public method to read the full per-page bitmap, and
-   writePacket()/readPacket()/the internal response buffer are all private
-   to the FPM class.
-
-   Patching the library itself was tried and reverted: this project's CI
-   (release-firmware.yml) and a fresh `arduino-cli lib install --git-url
-   .../FPM.git` both always pull the upstream repo's own default branch, so
-   a local-only patch to the installed library silently disappears on any
-   clean checkout/CI run -- it compiled locally but broke CI with "'class
-   FPM' has no member named 'getIndexTable'".
-
-   Instead, this reimplements just the one needed sensor command
-   (PS_ReadIndexTable / FPM_READTEMPLATEINDEX, 0x1F) directly against
-   sensorSerial, using only the public protocol constants fpm.h already
-   exposes. Packet framing mirrors FPM::writePacket()/readPacket() exactly
-   (verified against the library's source): big-endian multi-byte fields,
-   checksum = sum of packet-id + length + payload bytes. Unlike the
-   library's reader, this doesn't attempt to resync on a mid-packet error
-   (wrong address/pktId/checksum just fails outright rather than rescanning
-   for the next header) -- an acceptable simplification for an occasional,
-   retry-if-it-fails diagnostic command. */
-bool readSensorByte(uint8_t *out, uint32_t deadlineMs) {
-  while (millis() < deadlineMs) {
-    if (sensorSerial.available() > 0) {
-      *out = (uint8_t)sensorSerial.read();
-      return true;
-    }
-    yield();
+/* scrollOffset shifts which window of ENROLL_LIST_VISIBLE_ROWS is on screen --
+   needed because employeeListCount can exceed what fits, unlike the fixed
+   5-item main menu. */
+void drawEnrollList(uint8_t selectedIndex, uint8_t scrollOffset) {
+  drawEnrollListHeader();
+  uint8_t visibleCount = employeeListCount - scrollOffset;
+  if (visibleCount > ENROLL_LIST_VISIBLE_ROWS) visibleCount = ENROLL_LIST_VISIBLE_ROWS;
+  for (uint8_t row = 0; row < visibleCount; row++) {
+    uint8_t dataIndex = scrollOffset + row;
+    drawEnrollListItem(row, dataIndex, dataIndex == selectedIndex);
   }
-  return false;
+
+  TFT_display.setTextColor(TFT_GRAY);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(10, TFT_display.height() - 30);
+  TFT_display.print("Turn: Scroll  Press: Pick");
 }
 
-/* Reads the occupancy bitmap for one page (256 slots) directly off the
-   sensor. tableBuf must be at least 32 bytes (FPM_TEMPLATES_PER_PAGE / 8);
-   on success, exactly 32 bytes are written -- 1 bit per slot, LSb of
-   tableBuf[0] is slot 0, bit set = occupied, clear = free. Returns true on
-   success (including a well-formed NOK response from the sensor -- callers
-   should check via the sensor's own confirm code if that distinction ever
-   matters; here it's folded into "false" like any other read failure since
-   handleListSlots() only needs success/fail). */
-bool readSensorIndexTable(uint8_t page, uint8_t *tableBuf, uint8_t tableBufLen) {
-  uint8_t payload[2] = { (uint8_t)FPM_READTEMPLATEINDEX, page };
-  uint16_t totalLen = sizeof(payload) + 2; // +2 for the trailing checksum
+/* Blocking selection loop, modeled on promptOTAConfirmation(): encoder moves
+   the highlight (wrapping), a validated button-up confirms and returns the
+   selected employeeId. Times out (no separate cancel gesture, same as
+   promptOTAConfirmation -- the button here already means "confirm") and
+   returns -1 for cancelled. */
+long promptEnrollSelection() {
+  int32_t selectedIndex = 0;
+  uint8_t scrollOffset = 0;
+  int32_t lastDetent = readEncoderDetents();
+  drawEnrollList((uint8_t)selectedIndex, scrollOffset);
 
-  sensorSerial.write((uint8_t)(FPM_STARTCODE >> 8));
-  sensorSerial.write((uint8_t)FPM_STARTCODE);
-  sensorSerial.write((uint8_t)(FPM_DEFAULT_ADDRESS >> 24));
-  sensorSerial.write((uint8_t)(FPM_DEFAULT_ADDRESS >> 16));
-  sensorSerial.write((uint8_t)(FPM_DEFAULT_ADDRESS >> 8));
-  sensorSerial.write((uint8_t)(FPM_DEFAULT_ADDRESS));
-  sensorSerial.write((uint8_t)FPM_COMMANDPACKET);
-  sensorSerial.write((uint8_t)(totalLen >> 8));
-  sensorSerial.write((uint8_t)(totalLen));
+  uint32_t start = millis();
+  while (millis() - start < OTA_CONFIRM_TIMEOUT_MS) {
+    int32_t detents = readEncoderDetents();
+    if (detents != lastDetent) {
+      int32_t diff = detents - lastDetent;
+      lastDetent = detents;
 
-  uint16_t sum = (uint16_t)FPM_COMMANDPACKET + (totalLen >> 8) + (totalLen & 0xFF);
-  for (uint8_t i = 0; i < sizeof(payload); i++) {
-    sensorSerial.write(payload[i]);
-    sum += payload[i];
-  }
-  sensorSerial.write((uint8_t)(sum >> 8));
-  sensorSerial.write((uint8_t)sum);
+      int32_t newIndex = (selectedIndex + diff) % (int32_t)employeeListCount;
+      if (newIndex < 0) newIndex += employeeListCount;
+      selectedIndex = newIndex;
 
-  uint32_t deadline = millis() + FPM_DEFAULT_TIMEOUT;
-  uint8_t b;
-
-  uint16_t header = 0;
-  while (header != FPM_STARTCODE) {
-    if (!readSensorByte(&b, deadline)) return false;
-    header = (uint16_t)(header << 8) | b;
-  }
-
-  uint32_t addr = 0;
-  for (uint8_t i = 0; i < 4; i++) {
-    if (!readSensorByte(&b, deadline)) return false;
-    addr = (addr << 8) | b;
-  }
-  if (addr != FPM_DEFAULT_ADDRESS) return false;
-
-  if (!readSensorByte(&b, deadline)) return false;
-  uint8_t pktId = b;
-  if (pktId != FPM_ACKPACKET) return false;
-  uint16_t chksum = pktId;
-
-  uint16_t pktLen = 0;
-  for (uint8_t i = 0; i < 2; i++) {
-    if (!readSensorByte(&b, deadline)) return false;
-    pktLen = (uint16_t)(pktLen << 8) | b;
-  }
-  chksum = (uint16_t)(chksum + (pktLen >> 8) + (pktLen & 0xFF));
-
-  // payload = 1 confirm-code byte + up to tableBufLen bitmap bytes
-  if (pktLen < 3 || (pktLen - 2) > (uint16_t)(tableBufLen + 1)) return false;
-
-  uint16_t payloadLen = pktLen - 2;
-  uint8_t confirmCode = 0xFF;
-  uint16_t written = 0;
-
-  for (uint16_t i = 0; i < payloadLen; i++) {
-    if (!readSensorByte(&b, deadline)) return false;
-    chksum = (uint16_t)(chksum + b);
-    if (i == 0) {
-      confirmCode = b;
-    } else if (written < tableBufLen) {
-      tableBuf[written++] = b;
-    }
-  }
-
-  uint16_t pktChksum = 0;
-  for (uint8_t i = 0; i < 2; i++) {
-    if (!readSensorByte(&b, deadline)) return false;
-    pktChksum = (uint16_t)(pktChksum << 8) | b;
-  }
-  if (pktChksum != chksum) return false;
-
-  return confirmCode == 0x00; // FPMStatus::OK
-}
-
-/* Reports back the ids of every currently-free (available) sensor slot, read
-   directly off the sensor's own occupancy bitmap -- ground truth, independent
-   of whatever the backend's database thinks is enrolled. Runs synchronously
-   within pollForCommands(), same as DELETE/UPDATE (no menu interaction
-   needed).
-
-   On success, acks with a custom payload -- {"status":"DONE","free_slot_ids":
-   [...]} -- since the normal ackCommand() helper only carries a single
-   result_slot_id, not an array. Any failure (sensor missing, or a page read
-   error partway through) falls back to the plain ackCommand(id, false, -1),
-   discarding whatever was collected so far -- callers should treat a FAILED
-   LIST_SLOTS as "try again", not "the sensor is empty". */
-void handleListSlots(long commandId) {
-  if (!sensorReady && !initFingerprintSensor()) {
-    ackCommand(commandId, false, -1);
-    return;
-  }
-
-  showStatus(STATUS_WIFI, "Slots", "Reading...");
-
-  uint16_t capacity = haveParams ? params.capacity : 200;
-  uint16_t pages = (capacity / FPM_TEMPLATES_PER_PAGE) + 1;
-
-  DynamicJsonDocument doc(4096);
-  JsonArray freeSlots = doc.createNestedArray("free_slot_ids");
-
-  uint8_t tableBuf[FPM_TEMPLATES_PER_PAGE / 8]; // 1 bit per slot, 8 slots/byte
-  bool readError = false;
-
-  for (uint16_t page = 0; page < pages; page++) {
-    if (!readSensorIndexTable((uint8_t)page, tableBuf, sizeof(tableBuf))) {
-      readError = true;
-      break;
-    }
-
-    for (uint16_t byteIdx = 0; byteIdx < sizeof(tableBuf); byteIdx++) {
-      uint8_t group = tableBuf[byteIdx];
-      for (uint8_t bit = 0; bit < 8; bit++) {
-        uint16_t slotId = (page * FPM_TEMPLATES_PER_PAGE) + (byteIdx * 8) + bit;
-        if (slotId >= capacity) break; // don't report past the sensor's real capacity
-        bool occupied = (group & (1 << bit)) != 0;
-        if (!occupied) freeSlots.add(slotId);
+      if (selectedIndex < scrollOffset) {
+        scrollOffset = (uint8_t)selectedIndex;
+      } else if (selectedIndex >= scrollOffset + ENROLL_LIST_VISIBLE_ROWS) {
+        scrollOffset = (uint8_t)(selectedIndex - ENROLL_LIST_VISIBLE_ROWS + 1);
       }
+
+      drawEnrollList((uint8_t)selectedIndex, scrollOffset);
     }
+
+    noInterrupts();
+    buttonDownFlag = false; // consumed here so it can't be mistaken for a fresh press once we return
+    bool upFlag = buttonUpFlag;
+    buttonUpFlag = false;
+    interrupts();
+
+    if (upFlag) return employeeListIds[selectedIndex];
+
+    delay(5);
   }
 
-  if (readError) {
+  return -1; // timed out -- treat as cancelled
+}
+
+void doEnroll() {
+  if (!deviceRegistered) {
     setAuraError();
-    showStatus(STATUS_ERROR, "Slots", "Read Failed");
+    showStatus(STATUS_ERROR, "Device", "Not Registered");
     beepError();
-    delay(1200);
+    delay(900);
     setAuraIdle();
-    ackCommand(commandId, false, -1);
     return;
   }
 
-  doc["status"] = "DONE";
-
-  HTTPClient http;
-  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
-  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  String url = baseUrl + "/api/devices/commands/" + String(commandId) + "/ack";
-  http.begin(secureClient, url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device-Key", deviceApiKey);
-  http.addHeader("X-Device-Secret", deviceApiSecret);
-
-  String payload;
-  serializeJson(doc, payload);
-  int code = http.POST(payload);
-  Serial.print("[LIST_SLOTS] Command "); Serial.print(commandId);
-  Serial.print(" -> status code "); Serial.println(code);
-  http.end();
-
-  setAuraSuccess();
-  char countLine[24];
-  snprintf(countLine, sizeof(countLine), "%u free", (unsigned)freeSlots.size());
-  showStatus(STATUS_OK, "Slots", countLine);
-  beepSuccess();
-  delay(1200);
-  setAuraIdle();
-}
-
-void pollForCommands() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
-  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  http.begin(secureClient, commandsNextUrl);
-  http.addHeader("X-Device-Key", deviceApiKey);
-  http.addHeader("X-Device-Secret", deviceApiSecret);
-
-  int code = http.GET();
-  if (code != 200) {
-    http.end();
+  if (WiFi.status() != WL_CONNECTED && !quickReconnectWiFi()) {
+    setAuraError();
+    showStatus(STATUS_ERROR, "Network", "Offline");
+    beepError();
+    delay(900);
+    setAuraIdle();
     return;
   }
 
-  String body = http.getString();
-  http.end();
-
-  if (body.indexOf("\"command\":null") >= 0) return;
-
-  long commandId = extractJsonLong(body, "id");
-  if (commandId < 0) return;
-
-  String commandType = extractJsonString(body, "command_type");
-  long employeeId = extractJsonLong(body, "employee_id");
-  long targetSlot = extractJsonLong(body, "target_slot_id");
-
-  Serial.print("[COMMAND] id="); Serial.print(commandId);
-  Serial.print(" type="); Serial.print(commandType);
-  Serial.print(" employee="); Serial.println(employeeId);
-
-  if (commandType == "DELETE") {
-    handleRemoteDelete(commandId, targetSlot);
-  } else if (commandType == "ENROLL") {
-    queuePendingEnroll(commandId, employeeId);
-  } else if (commandType == "UPDATE") {
-    performOTAUpdate(commandId);
-  } else if (commandType == "LIST_SLOTS") {
-    handleListSlots(commandId);
+  setAuraProcessing();
+  showStatus(STATUS_WIFI, "Enrolls", "Loading...");
+  if (!fetchEmployeesWithoutEnrollment()) {
+    setAuraError();
+    showStatus(STATUS_ERROR, "Enrolls", "Fetch Failed");
+    beepError();
+    delay(900);
+    setAuraIdle();
+    return;
   }
-}
 
-void doRemoteEnroll() {
-  if (pendingEnrollCount == 0) return;
+  if (employeeListCount == 0) {
+    setAuraSuccess();
+    showStatus(STATUS_OK, "Enrolls", "All Done");
+    beepSuccess();
+    delay(900);
+    setAuraIdle();
+    return;
+  }
+
+  long chosenEmployeeId = promptEnrollSelection();
+  if (chosenEmployeeId < 0) {
+    setAuraIdle(); // cancelled/timed out -- silent return to menu
+    return;
+  }
+
   if (!sensorReady && !initFingerprintSensor()) {
     setAuraError();
     showStatus(STATUS_ERROR, "Sensor", "Missing");
     beepError();
+    delay(900);
+    setAuraIdle();
     return;
   }
 
-  long commandId = pendingEnrollCommandIds[0];
-  long employeeId = pendingEnrollEmployeeIds[0];
-
-  char empLine[20];
-  snprintf(empLine, sizeof(empLine), "Emp #%ld", employeeId);
-  showStatus(STATUS_FINGER, "Enroll For", empLine);
-  delay(1200);
-
   uint16_t newSlot = 0;
-  bool ok = captureAndStoreTemplate(&newSlot);
-  ackCommand(commandId, ok, ok ? (long)newSlot : -1);
-
-  // Remove from the pending list regardless of outcome -- a failed capture can be
-  // re-requested by HR from the portal, which queues a fresh command.
-  for (uint8_t i = 1; i < pendingEnrollCount; i++) {
-    pendingEnrollCommandIds[i - 1] = pendingEnrollCommandIds[i];
-    pendingEnrollEmployeeIds[i - 1] = pendingEnrollEmployeeIds[i];
+  bool captured = captureAndStoreTemplate(&newSlot);
+  if (!captured) {
+    // No local cleanup needed -- the backend only drops an employee from
+    // getEmployeesWithoutEnrollment once createEnrollment succeeds, so a
+    // failed attempt naturally reappears next time this list is fetched.
+    setAuraIdle();
+    return;
   }
-  pendingEnrollCount--;
+
+  bool posted = enrollEmployee(chosenEmployeeId, newSlot);
+  if (posted) setAuraSuccess(); else setAuraError();
+  showStatus(posted ? STATUS_OK : STATUS_ERROR, "Enroll", posted ? "Synced" : "Sync Failed");
+  if (posted) beepSuccess(); else beepError();
+  delay(1200);
+  setAuraIdle();
 }
 
 bool doLogin() {
@@ -1654,6 +1634,19 @@ bool doLogin() {
     setAuraError();
     showStatus(STATUS_ERROR, "Sensor", "Missing");
     beepError();
+    return false;
+  }
+
+  // Punches are timestamped and buffered locally, so a real synced clock is
+  // required before a scan is even attempted -- better a short wait here
+  // than a punch stored with a garbage epoch. Normally only true for the
+  // first ~15-30s after boot (loop() retries syncTimeIfNeeded() every 15s).
+  if (!timeSynced) {
+    setAuraError();
+    showStatus(STATUS_ERROR, "Clock", "Syncing...");
+    beepError();
+    delay(900);
+    setAuraIdle();
     return false;
   }
 
@@ -1672,7 +1665,15 @@ bool doLogin() {
     showStatus(STATUS_OK, "Match", idLine);
     beepSuccess();
     delay(350);
-    sendAttendanceLog(id, score);
+
+    appendPunch(id, getUtcEpochNow()); // instant, no network wait -- bulk-synced later
+    (void)score; // no longer forwarded anywhere; kept only because searchDatabase() requires the out-param
+
+    showStatus(STATUS_OK, "Recorded", idLine);
+    beepSuccess();
+    delay(900);
+    setAuraIdle();
+
     waitFingerRemoved();
     return true;
   }
@@ -1735,8 +1736,12 @@ void setup() {
   showStatus(STATUS_FINGER, "Boot", "Starting");
   delay(500);
 
-  loadConfig();
+  loadConfig(); // also restores the punch buffer and registration flag
   runConfigPortal(false); // try saved Wi-Fi; opens "Device-Setup" portal only if that fails
+
+  if (WiFi.status() == WL_CONNECTED && !deviceRegistered) {
+    registerDeviceIfNeeded(); // one shot at boot; loop()'s timer retries it if this fails
+  }
 
   if (!initFingerprintSensor()) {
     setAuraError();
@@ -1815,7 +1820,7 @@ void loop() {
       setAuraProcessing();
       switch (menuIndex) {
         case 0: doLogin(); break;
-        case 1: doRemoteEnroll(); break;
+        case 1: doEnroll(); break;
         case 2: runConfigPortal(true); break;
         case 3: checkForOTAUpdate(); break;
         case 4: doRestart(); break;
@@ -1867,12 +1872,19 @@ void loop() {
     }
   }
 
-  // ---- Background command polling ----
-  if (millis() - lastPollMs > POLL_INTERVAL_MS) {
-    pollForCommands();
-    lastPollMs = millis();
-    if (appState == STATE_MENU) drawMenu();
-    else enterClockState();
+  // ---- Background: device registration retry + punch-buffer flush ----
+  // Never touches the TFT (unlike the old pollForCommands() background poll) --
+  // the only screen touch in this whole path is appendPunch()'s "Buffer Full"
+  // message, which only fires synchronously from doLogin() itself.
+  if (millis() - lastPunchSyncMs > PUNCH_SYNC_INTERVAL_MS) {
+    lastPunchSyncMs = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!deviceRegistered) {
+        registerDeviceIfNeeded();
+      } else if (punchBufferCount > 0) {
+        syncPunchBuffer();
+      }
+    }
   }
 
   delay(5);
