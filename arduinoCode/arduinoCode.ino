@@ -67,10 +67,9 @@ WiFiClientSecure secureClient;
 /* ---------------- Backend endpoints (body-based auth: every request carries
    deviceId/keySecret in its JSON body, not headers) ---------------- */
 #define BACKEND_TENANT "ASDistributors" // compile-time tenant slug, same pattern as OTA_GITHUB_OWNER/REPO above
-#define EP_CREATE_ENROLLMENT            "/createEnrollment/" BACKEND_TENANT // device registration only -- see enrollEmployee()'s comment for why employee enrollment uses a different endpoint
+#define EP_CREATE_ENROLLMENT            "/createEnrollment/" BACKEND_TENANT // used for both device registration and employee-slot enrollment -- see enrollEmployee()'s comment
 #define EP_EMPLOYEES_WITHOUT_ENROLLMENT "/getEmployeesWithoutEnrollment/" BACKEND_TENANT
 #define EP_SYNC_PUNCH_ENTRIES           "/SyncDevicePunchEntries/" BACKEND_TENANT
-#define EP_UPDATE_EMPLOYEE_SLOT         "/updateEmployeeSlotId/" BACKEND_TENANT
 
 /* Punch buffer: local fingerprint matches accumulate here instead of hitting
    the backend immediately (see appendPunch()/syncPunchBuffer()), POSTed in
@@ -1459,41 +1458,37 @@ bool fetchEmployeesWithoutEnrollment() {
   return true;
 }
 
-/* Registers a captured fingerprint slot against an employee.
+/* Registers a captured fingerprint slot against an employee, via
+   createEnrollment(type=employee). This backend originally rejected this
+   exact call with "Enrollment Already Exists" (employee records are
+   pre-created elsewhere, e.g. an HR admin flow, which is why they show up
+   in getEmployeesWithoutEnrollment in the first place) -- an
+   updateEmployeeSlotId endpoint was used as a workaround for a while, but
+   the backend was fixed server-side and createEnrollment(type=employee) is
+   now confirmed live as the correct/current call again. No keySecret
+   needed on this one (confirmed live), unlike the device-registration call.
 
-   NOT createEnrollment -- confirmed live against the real backend that
-   employee records are pre-created elsewhere (e.g. an HR admin flow), which
-   is why they show up in getEmployeesWithoutEnrollment in the first place;
-   calling createEnrollment(type=employee) for one of them fails with
-   "Enrollment Already Exists" since the record already exists. This
-   endpoint is the correct one for attaching the slot the device just
-   captured. Also confirmed live: an employee can only be assigned a slot
-   ONCE -- a second call for an already-assigned employee is rejected
-   ("Employee is already assigned to a slot") regardless of the slotId
-   given, so this isn't reusable to reassign someone to a different slot.
-
-   deviceId is REQUIRED here, not just for consistency with the other
-   endpoints -- confirmed live that the slot<->employee mapping is scoped
-   per device. A slot assigned via this call WITHOUT deviceId is silently
-   unusable: it still removes the employee from getEmployeesWithoutEnrollment
-   (so it looks like it worked), but SyncDevicePunchEntries later fails with
-   "No employees found" for that slot, because there's no device association
-   to resolve it against. Omitting this field is the single easiest way to
-   silently break the whole enrollment -> punch-sync chain. */
+   deviceId is REQUIRED -- confirmed live that the slot<->employee mapping
+   is scoped per device, and this was confirmed again on this endpoint: a
+   slot enrolled without deviceId would (per the earlier
+   updateEmployeeSlotId experience) still look successful but be unusable --
+   SyncDevicePunchEntries would fail with "No employees found" for that slot
+   since there'd be no device association to resolve it against. */
 bool enrollEmployee(long employeeId, uint16_t slotId) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   DynamicJsonDocument doc(128);
-  doc["employeeId"] = employeeId;
-  doc["slotId"] = slotId;
   doc["deviceId"] = deviceId;
+  doc["employeeId"] = employeeId;
+  doc["type"] = "employee";
+  doc["slotId"] = slotId;
   String payload;
   serializeJson(doc, payload);
 
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  http.begin(secureClient, baseUrl + EP_UPDATE_EMPLOYEE_SLOT);
+  http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(payload);
   String body = (code == 200) ? http.getString() : String("");
