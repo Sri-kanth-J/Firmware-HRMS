@@ -1196,6 +1196,35 @@ void waitFingerRemoved() {
   }
 }
 
+/* One-time, automatic: occupies sensor slot 0 with a throwaway template so
+   it's never offered again by getFreeIndex() below. Confirmed live against
+   the real backend that slotId 0 gets stored as NULL there (0 is coerced as
+   falsy), which silently breaks that slot forever -- SyncDevicePunchEntries
+   rejects the whole batch it's in, every time, since sync is all-or-nothing.
+   Runs automatically the first time slot 0 is found free (a freshly wiped
+   sensor, or a brand new one) -- asks for two finger placements same as a
+   normal enrollment, but the resulting template is discarded, never linked
+   to any employee. Self-healing: works after any future wipe too, no
+   operational step to remember. */
+bool reserveSlotZero() {
+  showStatus(STATUS_FINGER, "One-time Setup", "Reserving Slot 0");
+  delay(1000);
+
+  if (!waitForPlaceFingerAndConvert(1, "Reserve 1/2")) return false;
+  showStatus(STATUS_FINGER, "Lift finger", "and wait");
+  waitFingerRemoved();
+  delay(400);
+  if (!waitForPlaceFingerAndConvert(2, "Reserve 2/2")) return false;
+
+  if (finger.generateTemplate() != FPMStatus::OK) return false;
+  if (finger.storeTemplate(0, 1) != FPMStatus::OK) return false;
+
+  showStatus(STATUS_OK, "Slot 0", "Reserved");
+  beepSuccess();
+  delay(800);
+  return true;
+}
+
 bool findFreeTemplateId(uint16_t *freeId) {
   uint16_t capacity = haveParams ? params.capacity : 200;
   uint16_t pages = (capacity / FPM_TEMPLATES_PER_PAGE) + 1;
@@ -1204,11 +1233,20 @@ bool findFreeTemplateId(uint16_t *freeId) {
     int16_t id = -1;
     FPMStatus st = finger.getFreeIndex((uint8_t)page, &id);
     if (st != FPMStatus::OK) return false;
+    if (id < 0) continue; // this page is full -- try the next one
 
-    if (id >= 0) {
-      *freeId = (uint16_t)id;
-      return true;
+    if (id == 0) {
+      // getFreeIndex() only ever reports a page's LOWEST free id, so as
+      // long as slot 0 stays free, page 0's other 255 slots are
+      // unreachable too -- the only way past this is to actually occupy
+      // slot 0 (see reserveSlotZero()), then re-ask the same page.
+      if (!reserveSlotZero()) return false;
+      st = finger.getFreeIndex((uint8_t)page, &id);
+      if (st != FPMStatus::OK || id <= 0) return false;
     }
+
+    *freeId = (uint16_t)id;
+    return true;
   }
   return false;
 }
