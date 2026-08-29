@@ -634,13 +634,8 @@ void drawSetupModeScreen(bool cancellable) {
   TFT_display.setCursor(20, bannerH + 60);
   TFT_display.print("Device-Setup");
 
-  TFT_display.setTextColor(TFT_BLACK);
-  TFT_display.setTextSize(2);
-  TFT_display.setCursor(20, bannerH + 96);
-  TFT_display.print("Password:");
-  TFT_display.setTextColor(TFT_BLUE);
-  TFT_display.setCursor(20, bannerH + 120);
-  TFT_display.print(DEVICE_SETUP_AP_PASSWORD);
+  // Deliberately no password shown here -- see DEVICE_SETUP_AP_PASSWORD's
+  // comment. Whoever provisions the device needs to already know it.
 
   TFT_display.setTextColor(TFT_GRAY);
   TFT_display.setTextSize(2);
@@ -686,17 +681,18 @@ bool runConfigPortal(bool forcePortal) {
   wm.setCustomMenuHTML(
     "<form action='/param' method='get'><button>Configure Backend</button></form><br/>\n"
     "<form action='/resetdevice' method='get'><button>Reset Device</button></form><br/>\n"
+    "<form action='/clearpunchbuffer' method='get'><button>Clear Punch Buffer</button></form><br/>\n"
   );
   std::vector<const char *> menu = {"wifi", "custom", "info", "exit"};
-  wm.setMenu(menu); // adds our "Configure Backend"/"Reset Device" buttons next to the native "Configure WiFi" one
+  wm.setMenu(menu); // adds our "Configure Backend"/"Reset Device"/"Clear Punch Buffer" buttons next to the native "Configure WiFi" one
 
-  // Registers a custom /resetdevice page on WiFiManager's own web server --
-  // fires once the server exists but before WiFiManager's own routes are
-  // attached, per its documented setWebServerCallback() contract, so this
-  // only ADDS a route rather than needing to override anything. Deliberately
-  // NOT reachable from the on-device menu -- see resetAllFingerprints().
-  // GET shows a warning + confirm button; only the POST actually resets the
-  // device, so a stray click/prefetch of the link itself can't trigger it.
+  // Registers custom pages on WiFiManager's own web server -- fires once the
+  // server exists but before WiFiManager's own routes are attached, per its
+  // documented setWebServerCallback() contract, so this only ADDS routes
+  // rather than needing to override anything. Deliberately NOT reachable
+  // from the on-device menu -- see resetAllFingerprints()/clearPunchBuffer().
+  // Each GET shows a warning + confirm button; only the POST actually acts,
+  // so a stray click/prefetch of the link itself can't trigger anything.
   wm.setWebServerCallback([&wm]() {
     wm.server->on("/resetdevice", HTTP_GET, [&wm]() {
       wm.server->send(200, "text/html",
@@ -729,6 +725,37 @@ bool runConfigPortal(bool forcePortal) {
         delay(1000);
         ESP.restart();
       }
+    });
+
+    // Standalone punch-buffer clear -- same underlying clearPunchBuffer()
+    // that resetAllFingerprints() also calls as part of a full reset, but
+    // exposed here separately for when only the unsynced-punch data needs
+    // clearing (e.g. the slot-0 poisoned-batch scenario) without wiping
+    // every enrolled fingerprint too.
+    wm.server->on("/clearpunchbuffer", HTTP_GET, [&wm]() {
+      wm.server->send(200, "text/html",
+        "<html><body>"
+        "<h2 style='color:#c00'>Clear Punch Buffer</h2>"
+        "<p>This deletes any punch records buffered on this device that "
+        "haven't synced to the backend yet. It does NOT affect enrolled "
+        "fingerprints or employees -- only unsynced punch history, which "
+        "will be lost.</p>"
+        "<form action='/clearpunchbuffer' method='POST'>"
+        "<button type='submit' style='background:#c00;color:#fff;padding:10px'>Yes, clear it</button>"
+        "</form>"
+        "<p><a href='/'>Cancel</a></p>"
+        "</body></html>");
+    });
+    wm.server->on("/clearpunchbuffer", HTTP_POST, [&wm]() {
+      clearPunchBuffer();
+      wm.server->send(200, "text/html",
+        "<html><body><h2>Punch buffer cleared</h2><p>The device is restarting.</p></body></html>");
+      // Same restart pattern as /resetdevice: send the response first and
+      // give the socket a moment to actually flush before the AP drops,
+      // then restart so the device comes back up clean rather than sitting
+      // in this AP/portal session indefinitely.
+      delay(1000);
+      ESP.restart();
     });
   });
 
@@ -1466,10 +1493,13 @@ bool registerDeviceIfNeeded() {
 
 /* Clears the buffered {slotId, timestamp} punch records waiting to sync --
    NOT the fingerprint templates themselves (those live on the R503 sensor;
-   see resetAllFingerprints(), which calls this as part of a merged "Reset
-   Device" action). This is the NVS data that got "poisoned" by a bad
-   slotId=0 entry earlier and needed a manual esptool erase to clear.
-   Deliberately scoped to ONLY the punch buffer: WiFi credentials, backend
+   see resetAllFingerprints() for that). This is the NVS data that got
+   "poisoned" by a bad slotId=0 entry earlier and needed a manual esptool
+   erase to clear. Exposed two ways in the "Device-Setup" AP portal (see
+   runConfigPortal()): standalone via its own /clearpunchbuffer page, for
+   when only unsynced-punch data needs clearing, and also called internally
+   by resetAllFingerprints() as part of a full "Reset Device". Deliberately
+   scoped to ONLY the punch buffer either way: WiFi credentials, backend
    config (deviceId/keySecret/baseUrl/tenantSlug), and the registration flag
    are all untouched. */
 void clearPunchBuffer() {
