@@ -8,6 +8,7 @@
 #include <Preferences.h>
 #include <DIYables_TFT_SPI.h>
 #include <time.h>
+#include <vector>
 #include "secrets.h" // GITHUB_PAT -- copy secrets.h.example to secrets.h and fill in a real token
 #include "ota_types.h" // OTAFetchStatus / OTAReleaseInfo -- see that header for why these aren't defined inline here
 
@@ -88,20 +89,42 @@ WiFiClientSecure secureClient;
 #define EP_SYNC_PUNCH_ENTRIES           "/SyncDevicePunchEntries/"
 
 /* Punch buffer: local fingerprint matches accumulate here instead of hitting
-   the backend immediately (see appendPunch()/syncPunchBuffer()), POSTed in
-   bulk periodically or immediately once full. Persisted to NVS (not just
-   RAM) because performOTAUpdate() calls ESP.restart() on every firmware
-   update, which would otherwise silently wipe any unsynced punches. */
-#define PUNCH_BUFFER_CAPACITY 30
+   the backend immediately (see appendPunch()/syncPunchBuffer()). Grows
+   dynamically rather than a fixed slot count -- during a busy punch-in/
+   punch-out window we'd rather hold everything locally than cap out and
+   start evicting history. Persisted to NVS (not just RAM) because
+   performOTAUpdate() calls ESP.restart() on every firmware update, which
+   would otherwise silently wipe any unsynced punches.
+
+   Sync is idle-triggered, not on a fixed timer: firing a sync is a blocking
+   HTTP call from loop() (see syncPunchBufferBatch()), and since the sketch
+   is single-threaded, a sync in flight delays processing of a finger-touch
+   that lands mid-request -- i.e. it can make a person standing at the
+   device wait. So instead of syncing on a flat interval regardless of
+   activity, background sync only fires once PUNCH_SYNC_IDLE_MS has passed
+   since the last punch (see appendPunch()/loop()) -- it never even gets
+   scheduled during a busy stretch, only once things go quiet. */
 struct PunchRecord {
   uint16_t slotId;
   uint32_t epochTime; // true UTC seconds since epoch -- see getUtcEpochNow()
 };
-PunchRecord punchBuffer[PUNCH_BUFFER_CAPACITY];
-uint8_t punchBufferCount = 0;
+std::vector<PunchRecord> punchBuffer;
+unsigned long lastPunchActivityMs = 0; // bumped on every appendPunch() -- gates the idle-sync trigger
 
-#define PUNCH_SYNC_INTERVAL_MS 20000
-unsigned long lastPunchSyncMs = 0;
+#define PUNCH_SYNC_IDLE_MS (5UL * 60UL * 1000UL) // background sync only fires after this long with no new punch
+#define PUNCH_SYNC_BATCH_SIZE 30 // punches per POST -- keeps the JSON payload bounded regardless of how large the buffer has grown
+#define PUNCH_BUFFER_HARD_CAP 300 // safety valve for a sustained outage (see appendPunch()) -- ~10 batches, well within RAM/NVS
+
+// Tighter than the general HTTP_CONNECT_TIMEOUT_MS/HTTP_RESPONSE_TIMEOUT_MS --
+// minimizes how long a walk-up employee could be blocked in the rare case a
+// background sync is already in flight right as they touch the sensor.
+#define PUNCH_SYNC_HTTP_CONNECT_TIMEOUT_MS  4000
+#define PUNCH_SYNC_HTTP_RESPONSE_TIMEOUT_MS 5000
+
+// How often loop() re-checks registration/punch-idle/enroll-list-refresh --
+// NOT how often a punch sync actually happens (see PUNCH_SYNC_IDLE_MS above).
+#define BACKGROUND_TASK_INTERVAL_MS 20000
+unsigned long lastBackgroundTaskMs = 0;
 
 bool deviceRegistered = false; // mirrors NVS "registered" -- gates enroll-fetch and punch-sync until createEnrollment(device) succeeds
 
@@ -570,8 +593,11 @@ void loadConfig() {
   baseUrl = prefs.getString("baseurl", DEFAULT_BASE_URL);
   tenantSlug = prefs.getString("tenant", DEFAULT_TENANT_SLUG);
   deviceRegistered = prefs.getBool("registered", false);
-  punchBufferCount = prefs.getUChar("punchcnt", 0);
-  prefs.getBytes("punchbuf", punchBuffer, sizeof(punchBuffer));
+  uint16_t storedCount = prefs.getUShort("punchcnt", 0);
+  if (storedCount > 0) {
+    punchBuffer.resize(storedCount);
+    prefs.getBytes("punchbuf", punchBuffer.data(), storedCount * sizeof(PunchRecord));
+  }
   prefs.end();
 }
 
@@ -585,14 +611,14 @@ void saveConfig() {
   Serial.println("[CONFIG] Saved device config to NVS");
 }
 
-/* Persists the punch buffer as a single fixed-size blob (always the full
-   PUNCH_BUFFER_CAPACITY worth, ~180 bytes) -- simpler and no worse on NVS's
-   wear budget than a variably-sized write, and cheaper than one NVS entry
-   per record. Called on every append and every successful sync. */
+/* Persists the punch buffer as a single variably-sized blob (count + that
+   many PunchRecords, up to PUNCH_BUFFER_HARD_CAP worth) -- one NVS entry
+   pair is simpler and cheaper than one entry per record. Called on every
+   append and every successful sync-batch. */
 void savePunchBuffer() {
   prefs.begin("fpmcfg", false);
-  prefs.putUChar("punchcnt", punchBufferCount);
-  prefs.putBytes("punchbuf", punchBuffer, sizeof(punchBuffer));
+  prefs.putUShort("punchcnt", (uint16_t)punchBuffer.size());
+  prefs.putBytes("punchbuf", punchBuffer.data(), punchBuffer.size() * sizeof(PunchRecord));
   prefs.end();
 }
 
@@ -1298,35 +1324,6 @@ void waitFingerRemoved() {
   }
 }
 
-/* One-time, automatic: occupies sensor slot 0 with a throwaway template so
-   it's never offered again by getFreeIndex() below. Confirmed live against
-   the real backend that slotId 0 gets stored as NULL there (0 is coerced as
-   falsy), which silently breaks that slot forever -- SyncDevicePunchEntries
-   rejects the whole batch it's in, every time, since sync is all-or-nothing.
-   Runs automatically the first time slot 0 is found free (a freshly wiped
-   sensor, or a brand new one) -- asks for two finger placements same as a
-   normal enrollment, but the resulting template is discarded, never linked
-   to any employee. Self-healing: works after any future wipe too, no
-   operational step to remember. */
-bool reserveSlotZero() {
-  showStatus(STATUS_FINGER, "One-time Setup", "Reserving Slot 0");
-  delay(1000);
-
-  if (!waitForPlaceFingerAndConvert(1, "Reserve 1/2")) return false;
-  showStatus(STATUS_FINGER, "Lift finger", "and wait");
-  waitFingerRemoved();
-  delay(400);
-  if (!waitForPlaceFingerAndConvert(2, "Reserve 2/2")) return false;
-
-  if (finger.generateTemplate() != FPMStatus::OK) return false;
-  if (finger.storeTemplate(0, 1) != FPMStatus::OK) return false;
-
-  showStatus(STATUS_OK, "Slot 0", "Reserved");
-  beepSuccess();
-  delay(800);
-  return true;
-}
-
 bool findFreeTemplateId(uint16_t *freeId) {
   uint16_t capacity = haveParams ? params.capacity : 200;
   uint16_t pages = (capacity / FPM_TEMPLATES_PER_PAGE) + 1;
@@ -1335,20 +1332,11 @@ bool findFreeTemplateId(uint16_t *freeId) {
     int16_t id = -1;
     FPMStatus st = finger.getFreeIndex((uint8_t)page, &id);
     if (st != FPMStatus::OK) return false;
-    if (id < 0) continue; // this page is full -- try the next one
 
-    if (id == 0) {
-      // getFreeIndex() only ever reports a page's LOWEST free id, so as
-      // long as slot 0 stays free, page 0's other 255 slots are
-      // unreachable too -- the only way past this is to actually occupy
-      // slot 0 (see reserveSlotZero()), then re-ask the same page.
-      if (!reserveSlotZero()) return false;
-      st = finger.getFreeIndex((uint8_t)page, &id);
-      if (st != FPMStatus::OK || id <= 0) return false;
+    if (id >= 0) {
+      *freeId = (uint16_t)id;
+      return true;
     }
-
-    *freeId = (uint16_t)id;
-    return true;
   }
   return false;
 }
@@ -1503,35 +1491,32 @@ bool registerDeviceIfNeeded() {
    config (deviceId/keySecret/baseUrl/tenantSlug), and the registration flag
    are all untouched. */
 void clearPunchBuffer() {
-  punchBufferCount = 0;
-  for (uint8_t i = 0; i < PUNCH_BUFFER_CAPACITY; i++) {
-    punchBuffer[i].slotId = 0;
-    punchBuffer[i].epochTime = 0;
-  }
+  punchBuffer.clear();
   savePunchBuffer();
 }
 
-/* Flushes the punch buffer in one all-or-nothing bulk POST -- the backend
-   gives no per-entry ack, so success clears the whole buffer and any
-   failure leaves it fully intact for the next attempt. */
-bool syncPunchBuffer() {
-  if (punchBufferCount == 0) return true;
+/* Posts the OLDEST up-to-PUNCH_SYNC_BATCH_SIZE punches in one all-or-nothing
+   bulk POST -- the backend gives no per-entry ack, so success removes just
+   that batch from the front of the buffer and any failure leaves the whole
+   buffer intact for the next attempt. Batching (rather than sending the
+   whole, now-unbounded buffer in one request) keeps the JSON payload size
+   bounded no matter how large the buffer has grown during an outage --
+   confirmed live that a 30-entry batch serializes to ~1.6KB of raw JSON,
+   but ArduinoJson's internal per-object/array overhead runs well above raw
+   text size for many small objects like these, so the 8KB doc budget below
+   is sized generously rather than cut close. */
+bool syncPunchBufferBatch() {
+  if (punchBuffer.empty()) return true;
   if (!deviceRegistered) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  // Sized generously for a full PUNCH_BUFFER_CAPACITY (30) batch -- confirmed
-  // live that 30 entries serialize to ~1.6KB of raw JSON, but ArduinoJson's
-  // internal per-object/array overhead runs well above raw text size for
-  // many small objects like these (30 objects x 2 fields each), so building
-  // toward a tight budget risks silent truncation right at the one moment
-  // (a full buffer) this whole feature exists for. RAM is abundant here
-  // (this is a transient allocation against ~276KB free), so there's no
-  // reason to cut this close.
+  size_t batchSize = min(punchBuffer.size(), (size_t)PUNCH_SYNC_BATCH_SIZE);
+
   DynamicJsonDocument doc(8192);
   doc["deviceId"] = deviceId;
   doc["keySecret"] = keySecret;
   JsonArray entries = doc.createNestedArray("entries");
-  for (uint8_t i = 0; i < punchBufferCount; i++) {
+  for (size_t i = 0; i < batchSize; i++) {
     JsonObject e = entries.createNestedObject();
     e["slotId"] = punchBuffer[i].slotId;
     e["timestamp"] = formatIso8601Utc(punchBuffer[i].epochTime);
@@ -1540,8 +1525,8 @@ bool syncPunchBuffer() {
   serializeJson(doc, payload);
 
   HTTPClient http;
-  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
-  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.setConnectTimeout(PUNCH_SYNC_HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(PUNCH_SYNC_HTTP_RESPONSE_TIMEOUT_MS);
   http.begin(secureClient, baseUrl + EP_SYNC_PUNCH_ENTRIES + tenantSlug);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(payload);
@@ -1552,31 +1537,49 @@ bool syncPunchBuffer() {
 
   if (code != 200 || !bodyNotifierIsSuccess(body)) return false;
 
-  punchBufferCount = 0;
+  punchBuffer.erase(punchBuffer.begin(), punchBuffer.begin() + batchSize);
   savePunchBuffer();
   return true;
 }
 
-/* Buffers a punch locally -- instant, no network wait. If the buffer is
-   already full, one blocking sync is attempted right now; if that also
-   fails, the OLDEST record is evicted to make room. Evict-oldest (not
-   reject-newest) because rejecting the punch happening right now would
-   leave the person standing at the device with zero record and no
-   confirmation -- the worst outcome for the one person actually present.
-   This only triggers after PUNCH_BUFFER_CAPACITY unsynced punches AND a
-   live retry just failed, i.e. a sustained outage, not routine use. */
+/* Drains the whole buffer, one PUNCH_SYNC_BATCH_SIZE batch per call. Called
+   from loop() only once the device has been idle for PUNCH_SYNC_IDLE_MS
+   (see appendPunch()) -- never while someone might be mid-punch. Stops at
+   the first failed batch; whatever's left stays buffered for the next idle
+   window. */
+bool syncPunchBuffer() {
+  while (!punchBuffer.empty()) {
+    if (!syncPunchBufferBatch()) return false;
+  }
+  return true;
+}
+
+/* Buffers a punch locally -- instant, no network wait -- and resets the
+   idle timer that gates background syncing (see loop()), so a sync is
+   never scheduled while people are actively punching. Grows the buffer as
+   needed rather than capping at a fixed size, so a busy stretch never
+   evicts anyone's punch. PUNCH_BUFFER_HARD_CAP is purely a safety valve for
+   a sustained outage (not routine use): if it's ever hit, one blocking
+   sync is attempted right now, and if that also fails, the OLDEST record
+   is evicted to make room. Evict-oldest (not reject-newest) because
+   rejecting the punch happening right now would leave the person standing
+   at the device with zero record and no confirmation -- the worst outcome
+   for the one person actually present. */
 void appendPunch(uint16_t slotId, uint32_t utcEpoch) {
-  if (punchBufferCount >= PUNCH_BUFFER_CAPACITY) {
+  lastPunchActivityMs = millis();
+
+  if (punchBuffer.size() >= PUNCH_BUFFER_HARD_CAP) {
     showStatus(STATUS_WIFI, "Sync", "Buffer Full");
-    if (!syncPunchBuffer()) {
-      for (uint8_t i = 1; i < PUNCH_BUFFER_CAPACITY; i++) punchBuffer[i - 1] = punchBuffer[i];
-      punchBufferCount = PUNCH_BUFFER_CAPACITY - 1;
-      Serial.println("[PUNCH] Buffer full and sync failed -- evicted oldest record");
+    if (!syncPunchBufferBatch()) {
+      punchBuffer.erase(punchBuffer.begin());
+      Serial.println("[PUNCH] Buffer at hard cap and sync failed -- evicted oldest record");
     }
   }
-  punchBuffer[punchBufferCount].slotId = slotId;
-  punchBuffer[punchBufferCount].epochTime = utcEpoch;
-  punchBufferCount++;
+
+  PunchRecord rec;
+  rec.slotId = slotId;
+  rec.epochTime = utcEpoch;
+  punchBuffer.push_back(rec);
   savePunchBuffer();
 }
 
@@ -1872,8 +1875,8 @@ void doEnroll() {
    /resetdevice page instead (see runConfigPortal()), which is itself gated
    behind DEVICE_SETUP_AP_PASSWORD and its own web-side confirmation step.
    Deleting all templates also frees slot 0 again, which
-   findFreeTemplateId()/reserveSlotZero() already handle automatically on
-   the next enrollment -- no special-casing needed here. */
+   findFreeTemplateId() will simply hand out on the next enrollment same as
+   any other slot -- no special-casing needed here. */
 bool resetAllFingerprints() {
   if (!sensorReady && !initFingerprintSensor()) return false;
 
@@ -2145,13 +2148,16 @@ void loop() {
   // and its own longer interval). Only the enroll-list refresh redraws the
   // TFT (to update the "Enrolls (N)" badge if the menu happens to be open) --
   // registration/punch-sync never touch the screen; the only screen touch
-  // outside this block is appendPunch()'s "Buffer Full" message.
-  if (millis() - lastPunchSyncMs > PUNCH_SYNC_INTERVAL_MS) {
-    lastPunchSyncMs = millis();
+  // outside this block is appendPunch()'s "Buffer Full" message. Punch sync
+  // itself only runs once idle for PUNCH_SYNC_IDLE_MS (see appendPunch()'s
+  // comment) -- this tick just checks whether that idle window has been
+  // reached, it doesn't gate the sync on its own.
+  if (millis() - lastBackgroundTaskMs > BACKGROUND_TASK_INTERVAL_MS) {
+    lastBackgroundTaskMs = millis();
     if (WiFi.status() == WL_CONNECTED) {
       if (!deviceRegistered) {
         registerDeviceIfNeeded();
-      } else if (punchBufferCount > 0) {
+      } else if (!punchBuffer.empty() && millis() - lastPunchActivityMs >= PUNCH_SYNC_IDLE_MS) {
         syncPunchBuffer();
       } else if (millis() - lastEnrollListRefreshMs > ENROLL_LIST_REFRESH_INTERVAL_MS) {
         lastEnrollListRefreshMs = millis();
