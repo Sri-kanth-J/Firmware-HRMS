@@ -19,6 +19,7 @@
 #define DEFAULT_BASE_URL "https://example.com/api"
 #define DEFAULT_DEVICE_ID "device-id"
 #define DEFAULT_KEY_SECRET "key-secret"
+#define DEFAULT_TENANT_SLUG "ASDistributors"
 
 /* WPA2 password for the "Device-Setup" AP (see runConfigPortal()) --
    prevents anyone in radio range from opening the config/reset portal, not
@@ -56,6 +57,7 @@
 String deviceId;
 String keySecret;
 String baseUrl; // must include the "/api" suffix -- endpoints are baseUrl + "/createEnrollment/..." etc.
+String tenantSlug; // path segment after each endpoint, e.g. baseUrl + "/createEnrollment/" + tenantSlug
 
 Preferences prefs;
 bool shouldSaveConfig = false;
@@ -71,11 +73,15 @@ WiFiClientSecure secureClient;
 #define HTTP_RESPONSE_TIMEOUT_MS 8000
 
 /* ---------------- Backend endpoints (body-based auth: every request carries
-   deviceId/keySecret in its JSON body, not headers) ---------------- */
-#define BACKEND_TENANT "ASDistributors" // compile-time tenant slug, same pattern as OTA_GITHUB_OWNER/REPO above
-#define EP_CREATE_ENROLLMENT            "/createEnrollment/" BACKEND_TENANT // used for both device registration and employee-slot enrollment -- see enrollEmployee()'s comment
-#define EP_EMPLOYEES_WITHOUT_ENROLLMENT "/getEmployeesWithoutEnrollment/" BACKEND_TENANT
-#define EP_SYNC_PUNCH_ENTRIES           "/SyncDevicePunchEntries/" BACKEND_TENANT
+   deviceId/keySecret in its JSON body, not headers) ----------------
+   The tenant slug (e.g. "ASDistributors") used to be a compile-time
+   constant here; it's now the runtime `tenantSlug` field instead (see
+   "Runtime config" below), set via the "Configure Backend" portal page
+   alongside Backend Base URL -- so each call site below builds its full
+   URL as baseUrl + EP_* + tenantSlug rather than a single baked-in string. */
+#define EP_CREATE_ENROLLMENT            "/createEnrollment/" // used for both device registration and employee-slot enrollment -- see enrollEmployee()'s comment
+#define EP_EMPLOYEES_WITHOUT_ENROLLMENT "/getEmployeesWithoutEnrollment/"
+#define EP_SYNC_PUNCH_ENTRIES           "/SyncDevicePunchEntries/"
 
 /* Punch buffer: local fingerprint matches accumulate here instead of hitting
    the backend immediately (see appendPunch()/syncPunchBuffer()), POSTed in
@@ -558,6 +564,7 @@ void loadConfig() {
   deviceId = prefs.getString("deviceid", DEFAULT_DEVICE_ID);
   keySecret = prefs.getString("keysecret", DEFAULT_KEY_SECRET);
   baseUrl = prefs.getString("baseurl", DEFAULT_BASE_URL);
+  tenantSlug = prefs.getString("tenant", DEFAULT_TENANT_SLUG);
   deviceRegistered = prefs.getBool("registered", false);
   punchBufferCount = prefs.getUChar("punchcnt", 0);
   prefs.getBytes("punchbuf", punchBuffer, sizeof(punchBuffer));
@@ -569,6 +576,7 @@ void saveConfig() {
   prefs.putString("deviceid", deviceId);
   prefs.putString("keysecret", keySecret);
   prefs.putString("baseurl", baseUrl);
+  prefs.putString("tenant", tenantSlug);
   prefs.end();
   Serial.println("[CONFIG] Saved device config to NVS");
 }
@@ -644,8 +652,9 @@ void configPortalStartedCallback(WiFiManager *wmPtr) {
 /* Single portal, two menu entries: connecting to the "Device-Setup" access
    point opens one WiFiManager captive portal whose root page offers
    "Configure WiFi" (native SSID/password page) and "Configure Backend" (our
-   Device ID / Device Key Secret / Backend Base URL fields, on their own
-   page via setParamsPage so they never show up on the Wi-Fi page). Either,
+   Device ID / Device Key Secret / Backend Base URL / Backend Tenant Slug
+   fields, on their own page via setParamsPage so they never show up on the
+   Wi-Fi page). Either,
    both, or neither can be filled in during the same session.
 
    forcePortal=false: try whatever Wi-Fi credentials WiFiManager already has
@@ -663,9 +672,11 @@ bool runConfigPortal(bool forcePortal) {
   WiFiManagerParameter custom_deviceid("deviceid", "Device ID", deviceId.c_str(), 40);
   WiFiManagerParameter custom_keysecret("keysecret", "Device Key Secret", keySecret.c_str(), 64);
   WiFiManagerParameter custom_baseurl("baseurl", "Backend Base URL (include /api)", baseUrl.c_str(), 80);
+  WiFiManagerParameter custom_tenant("tenant", "Backend Tenant Slug", tenantSlug.c_str(), 40);
   wm.addParameter(&custom_deviceid);
   wm.addParameter(&custom_keysecret);
   wm.addParameter(&custom_baseurl);
+  wm.addParameter(&custom_tenant);
 
   wm.setParamsPage(true); // keep the backend fields off the Wi-Fi page, on their own page instead
   wm.setCustomMenuHTML(
@@ -699,8 +710,19 @@ bool runConfigPortal(bool forcePortal) {
       bool ok = resetAllFingerprints();
       wm.server->send(200, "text/html",
         ok
-          ? "<html><body><h2>Reset complete</h2><p>All fingerprints deleted.</p><p><a href='/'>Back</a></p></body></html>"
+          ? "<html><body><h2>Reset complete</h2><p>All fingerprints deleted. The device is restarting.</p></body></html>"
           : "<html><body><h2 style='color:#c00'>Reset failed</h2><p>Could not reach the fingerprint sensor. Check wiring and try again.</p><p><a href='/'>Back</a></p></body></html>");
+      // Restart on success so the device comes back up in a clean state
+      // rather than sitting in this AP/portal session indefinitely -- send()
+      // above queues the response, but the socket needs a moment to actually
+      // flush before the AP drops, same pattern as the OTA-update ack sent
+      // just before ESP.restart() elsewhere in this file. Only restart on
+      // success -- a failure should let the operator retry (e.g. reseat the
+      // sensor wiring) without an unexpected reboot cutting off the session.
+      if (ok) {
+        delay(1000);
+        ESP.restart();
+      }
     });
   });
 
@@ -747,6 +769,7 @@ bool runConfigPortal(bool forcePortal) {
     deviceId = String(custom_deviceid.getValue());
     keySecret = String(custom_keysecret.getValue());
     baseUrl = String(custom_baseurl.getValue());
+    tenantSlug = String(custom_tenant.getValue());
     saveConfig();
   }
 
@@ -1366,7 +1389,7 @@ bool registerDeviceIfNeeded() {
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT);
+  http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT + tenantSlug);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(payload);
   String body = (code == 200) ? http.getString() : String("");
@@ -1428,7 +1451,7 @@ bool syncPunchBuffer() {
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  http.begin(secureClient, baseUrl + EP_SYNC_PUNCH_ENTRIES);
+  http.begin(secureClient, baseUrl + EP_SYNC_PUNCH_ENTRIES + tenantSlug);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(payload);
   String body = (code == 200) ? http.getString() : String("");
@@ -1480,7 +1503,7 @@ bool fetchEmployeesWithoutEnrollment() {
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  http.begin(secureClient, baseUrl + EP_EMPLOYEES_WITHOUT_ENROLLMENT);
+  http.begin(secureClient, baseUrl + EP_EMPLOYEES_WITHOUT_ENROLLMENT + tenantSlug);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(payload);
   String body = (code == 200) ? http.getString() : String("");
@@ -1534,7 +1557,7 @@ bool enrollEmployee(long employeeId, uint16_t slotId) {
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT);
+  http.begin(secureClient, baseUrl + EP_CREATE_ENROLLMENT + tenantSlug);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(payload);
   String body = (code == 200) ? http.getString() : String("");
