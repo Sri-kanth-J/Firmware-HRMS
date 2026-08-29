@@ -24,8 +24,12 @@
 /* WPA2 password for the "Device-Setup" AP (see runConfigPortal()) --
    prevents anyone in radio range from opening the config/reset portal, not
    just anyone standing at the physical device. Must be 8-63 characters
-   (WPA2-PSK requirement). */
-#define DEVICE_SETUP_AP_PASSWORD "Asperminds"
+   (WPA2-PSK requirement). Deliberately never shown on the device's own
+   screen (see drawSetupModeScreen()) -- displaying it there would let
+   anyone standing at the unit read it off and defeat the whole point of
+   gating Reset Device/backend config behind a password only whoever
+   provisions the device should know. */
+#define DEVICE_SETUP_AP_PASSWORD "Q!w2e3r4T%"
 
 /* ---------------- Firmware / OTA update config ----------------
    FIRMWARE_VERSION must match the GitHub Release tag (a leading "v" is
@@ -630,13 +634,8 @@ void drawSetupModeScreen(bool cancellable) {
   TFT_display.setCursor(20, bannerH + 60);
   TFT_display.print("Device-Setup");
 
-  TFT_display.setTextColor(TFT_BLACK);
-  TFT_display.setTextSize(2);
-  TFT_display.setCursor(20, bannerH + 96);
-  TFT_display.print("Password:");
-  TFT_display.setTextColor(TFT_BLUE);
-  TFT_display.setCursor(20, bannerH + 120);
-  TFT_display.print(DEVICE_SETUP_AP_PASSWORD);
+  // Deliberately no password shown here -- see DEVICE_SETUP_AP_PASSWORD's
+  // comment. Whoever provisions the device needs to already know it.
 
   TFT_display.setTextColor(TFT_GRAY);
   TFT_display.setTextSize(2);
@@ -682,24 +681,27 @@ bool runConfigPortal(bool forcePortal) {
   wm.setCustomMenuHTML(
     "<form action='/param' method='get'><button>Configure Backend</button></form><br/>\n"
     "<form action='/resetdevice' method='get'><button>Reset Device</button></form><br/>\n"
+    "<form action='/clearpunchbuffer' method='get'><button>Clear Punch Buffer</button></form><br/>\n"
   );
   std::vector<const char *> menu = {"wifi", "custom", "info", "exit"};
-  wm.setMenu(menu); // adds our "Configure Backend"/"Reset Device" buttons next to the native "Configure WiFi" one
+  wm.setMenu(menu); // adds our "Configure Backend"/"Reset Device"/"Clear Punch Buffer" buttons next to the native "Configure WiFi" one
 
-  // Registers a custom /resetdevice page on WiFiManager's own web server --
-  // fires once the server exists but before WiFiManager's own routes are
-  // attached, per its documented setWebServerCallback() contract, so this
-  // only ADDS a route rather than needing to override anything. Deliberately
-  // NOT reachable from the on-device menu -- see resetAllFingerprints().
-  // GET shows a warning + confirm button; only the POST actually wipes the
-  // sensor, so a stray click/prefetch of the link itself can't trigger it.
+  // Registers custom pages on WiFiManager's own web server -- fires once the
+  // server exists but before WiFiManager's own routes are attached, per its
+  // documented setWebServerCallback() contract, so this only ADDS routes
+  // rather than needing to override anything. Deliberately NOT reachable
+  // from the on-device menu -- see resetAllFingerprints()/clearPunchBuffer().
+  // Each GET shows a warning + confirm button; only the POST actually acts,
+  // so a stray click/prefetch of the link itself can't trigger anything.
   wm.setWebServerCallback([&wm]() {
     wm.server->on("/resetdevice", HTTP_GET, [&wm]() {
       wm.server->send(200, "text/html",
         "<html><body>"
         "<h2 style='color:#c00'>Reset Device</h2>"
-        "<p>This deletes <b>ALL</b> fingerprints stored on this device. "
-        "Every enrolled employee will need to be re-enrolled. This cannot be undone.</p>"
+        "<p>This deletes <b>ALL</b> fingerprints stored on this device, and "
+        "clears any punch records buffered here that haven't synced to the "
+        "backend yet. Every enrolled employee will need to be re-enrolled. "
+        "This cannot be undone.</p>"
         "<form action='/resetdevice' method='POST'>"
         "<button type='submit' style='background:#c00;color:#fff;padding:10px'>Yes, delete everything</button>"
         "</form>"
@@ -710,7 +712,7 @@ bool runConfigPortal(bool forcePortal) {
       bool ok = resetAllFingerprints();
       wm.server->send(200, "text/html",
         ok
-          ? "<html><body><h2>Reset complete</h2><p>All fingerprints deleted. The device is restarting.</p></body></html>"
+          ? "<html><body><h2>Reset complete</h2><p>All fingerprints and buffered punches deleted. The device is restarting.</p></body></html>"
           : "<html><body><h2 style='color:#c00'>Reset failed</h2><p>Could not reach the fingerprint sensor. Check wiring and try again.</p><p><a href='/'>Back</a></p></body></html>");
       // Restart on success so the device comes back up in a clean state
       // rather than sitting in this AP/portal session indefinitely -- send()
@@ -723,6 +725,37 @@ bool runConfigPortal(bool forcePortal) {
         delay(1000);
         ESP.restart();
       }
+    });
+
+    // Standalone punch-buffer clear -- same underlying clearPunchBuffer()
+    // that resetAllFingerprints() also calls as part of a full reset, but
+    // exposed here separately for when only the unsynced-punch data needs
+    // clearing (e.g. the slot-0 poisoned-batch scenario) without wiping
+    // every enrolled fingerprint too.
+    wm.server->on("/clearpunchbuffer", HTTP_GET, [&wm]() {
+      wm.server->send(200, "text/html",
+        "<html><body>"
+        "<h2 style='color:#c00'>Clear Punch Buffer</h2>"
+        "<p>This deletes any punch records buffered on this device that "
+        "haven't synced to the backend yet. It does NOT affect enrolled "
+        "fingerprints or employees -- only unsynced punch history, which "
+        "will be lost.</p>"
+        "<form action='/clearpunchbuffer' method='POST'>"
+        "<button type='submit' style='background:#c00;color:#fff;padding:10px'>Yes, clear it</button>"
+        "</form>"
+        "<p><a href='/'>Cancel</a></p>"
+        "</body></html>");
+    });
+    wm.server->on("/clearpunchbuffer", HTTP_POST, [&wm]() {
+      clearPunchBuffer();
+      wm.server->send(200, "text/html",
+        "<html><body><h2>Punch buffer cleared</h2><p>The device is restarting.</p></body></html>");
+      // Same restart pattern as /resetdevice: send the response first and
+      // give the socket a moment to actually flush before the AP drops,
+      // then restart so the device comes back up clean rather than sitting
+      // in this AP/portal session indefinitely.
+      delay(1000);
+      ESP.restart();
     });
   });
 
@@ -1265,6 +1298,35 @@ void waitFingerRemoved() {
   }
 }
 
+/* One-time, automatic: occupies sensor slot 0 with a throwaway template so
+   it's never offered again by getFreeIndex() below. Confirmed live against
+   the real backend that slotId 0 gets stored as NULL there (0 is coerced as
+   falsy), which silently breaks that slot forever -- SyncDevicePunchEntries
+   rejects the whole batch it's in, every time, since sync is all-or-nothing.
+   Runs automatically the first time slot 0 is found free (a freshly wiped
+   sensor, or a brand new one) -- asks for two finger placements same as a
+   normal enrollment, but the resulting template is discarded, never linked
+   to any employee. Self-healing: works after any future wipe too, no
+   operational step to remember. */
+bool reserveSlotZero() {
+  showStatus(STATUS_FINGER, "One-time Setup", "Reserving Slot 0");
+  delay(1000);
+
+  if (!waitForPlaceFingerAndConvert(1, "Reserve 1/2")) return false;
+  showStatus(STATUS_FINGER, "Lift finger", "and wait");
+  waitFingerRemoved();
+  delay(400);
+  if (!waitForPlaceFingerAndConvert(2, "Reserve 2/2")) return false;
+
+  if (finger.generateTemplate() != FPMStatus::OK) return false;
+  if (finger.storeTemplate(0, 1) != FPMStatus::OK) return false;
+
+  showStatus(STATUS_OK, "Slot 0", "Reserved");
+  beepSuccess();
+  delay(800);
+  return true;
+}
+
 bool findFreeTemplateId(uint16_t *freeId) {
   uint16_t capacity = haveParams ? params.capacity : 200;
   uint16_t pages = (capacity / FPM_TEMPLATES_PER_PAGE) + 1;
@@ -1273,11 +1335,20 @@ bool findFreeTemplateId(uint16_t *freeId) {
     int16_t id = -1;
     FPMStatus st = finger.getFreeIndex((uint8_t)page, &id);
     if (st != FPMStatus::OK) return false;
+    if (id < 0) continue; // this page is full -- try the next one
 
-    if (id >= 0) {
-      *freeId = (uint16_t)id;
-      return true;
+    if (id == 0) {
+      // getFreeIndex() only ever reports a page's LOWEST free id, so as
+      // long as slot 0 stays free, page 0's other 255 slots are
+      // unreachable too -- the only way past this is to actually occupy
+      // slot 0 (see reserveSlotZero()), then re-ask the same page.
+      if (!reserveSlotZero()) return false;
+      st = finger.getFreeIndex((uint8_t)page, &id);
+      if (st != FPMStatus::OK || id <= 0) return false;
     }
+
+    *freeId = (uint16_t)id;
+    return true;
   }
   return false;
 }
@@ -1418,6 +1489,26 @@ bool registerDeviceIfNeeded() {
   fetchEmployeesWithoutEnrollment();
   lastEnrollListRefreshMs = millis();
   return true;
+}
+
+/* Clears the buffered {slotId, timestamp} punch records waiting to sync --
+   NOT the fingerprint templates themselves (those live on the R503 sensor;
+   see resetAllFingerprints() for that). This is the NVS data that got
+   "poisoned" by a bad slotId=0 entry earlier and needed a manual esptool
+   erase to clear. Exposed two ways in the "Device-Setup" AP portal (see
+   runConfigPortal()): standalone via its own /clearpunchbuffer page, for
+   when only unsynced-punch data needs clearing, and also called internally
+   by resetAllFingerprints() as part of a full "Reset Device". Deliberately
+   scoped to ONLY the punch buffer either way: WiFi credentials, backend
+   config (deviceId/keySecret/baseUrl/tenantSlug), and the registration flag
+   are all untouched. */
+void clearPunchBuffer() {
+  punchBufferCount = 0;
+  for (uint8_t i = 0; i < PUNCH_BUFFER_CAPACITY; i++) {
+    punchBuffer[i].slotId = 0;
+    punchBuffer[i].epochTime = 0;
+  }
+  savePunchBuffer();
 }
 
 /* Flushes the punch buffer in one all-or-nothing bulk POST -- the backend
@@ -1766,16 +1857,21 @@ void doEnroll() {
   setAuraIdle();
 }
 
-/* Wipes every fingerprint template on the sensor via the FPM library's
-   emptyDatabase() (maps to the R503's PS_Empty command). Deliberately NOT
-   reachable from the on-device menu -- deleting every employee's
-   fingerprint is irreversible and affects everyone who uses this device,
-   so it needs to require the same access as changing Wi-Fi/backend config
-   (the "Device-Setup" AP's password), not be reachable by anyone who just
-   picks up the unit and scrolls the menu. Triggered from the WiFiManager
-   portal's /resetdevice page instead (see runConfigPortal()), which is
-   itself gated behind DEVICE_SETUP_AP_PASSWORD and its own web-side
-   confirmation step. Deleting all templates also frees slot 0 again, which
+/* Full device reset: wipes every fingerprint template on the sensor via the
+   FPM library's emptyDatabase() (maps to the R503's PS_Empty command), AND
+   clears any buffered punch records waiting to sync (see
+   clearPunchBuffer()) -- one merged action, not two separate ones.
+   All-or-nothing: the punch buffer is only cleared if the sensor wipe
+   actually succeeds, so a failure (e.g. sensor missing) doesn't silently
+   discard punch history that hasn't synced yet. Deliberately NOT reachable
+   from the on-device menu -- deleting every employee's fingerprint is
+   irreversible and affects everyone who uses this device, so it needs to
+   require the same access as changing Wi-Fi/backend config (the
+   "Device-Setup" AP's password), not be reachable by anyone who just picks
+   up the unit and scrolls the menu. Triggered from the WiFiManager portal's
+   /resetdevice page instead (see runConfigPortal()), which is itself gated
+   behind DEVICE_SETUP_AP_PASSWORD and its own web-side confirmation step.
+   Deleting all templates also frees slot 0 again, which
    findFreeTemplateId()/reserveSlotZero() already handle automatically on
    the next enrollment -- no special-casing needed here. */
 bool resetAllFingerprints() {
@@ -1785,6 +1881,7 @@ bool resetAllFingerprints() {
   FPMStatus st = finger.emptyDatabase();
 
   if (st == FPMStatus::OK) {
+    clearPunchBuffer();
     setAuraSuccess();
     showStatus(STATUS_OK, "Reset", "Complete");
     beepSuccess();
