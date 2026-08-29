@@ -20,6 +20,12 @@
 #define DEFAULT_DEVICE_ID "device-id"
 #define DEFAULT_KEY_SECRET "key-secret"
 
+/* WPA2 password for the "Device-Setup" AP (see runConfigPortal()) --
+   prevents anyone in radio range from opening the config/reset portal, not
+   just anyone standing at the physical device. Must be 8-63 characters
+   (WPA2-PSK requirement). */
+#define DEVICE_SETUP_AP_PASSWORD "Asperminds"
+
 /* ---------------- Firmware / OTA update config ----------------
    FIRMWARE_VERSION must match the GitHub Release tag (a leading "v" is
    stripped before comparing) for the device to consider itself up to date.
@@ -616,6 +622,14 @@ void drawSetupModeScreen(bool cancellable) {
   TFT_display.setCursor(20, bannerH + 60);
   TFT_display.print("Device-Setup");
 
+  TFT_display.setTextColor(TFT_BLACK);
+  TFT_display.setTextSize(2);
+  TFT_display.setCursor(20, bannerH + 96);
+  TFT_display.print("Password:");
+  TFT_display.setTextColor(TFT_BLUE);
+  TFT_display.setCursor(20, bannerH + 120);
+  TFT_display.print(DEVICE_SETUP_AP_PASSWORD);
+
   TFT_display.setTextColor(TFT_GRAY);
   TFT_display.setTextSize(2);
   TFT_display.setCursor(20, TFT_display.height() - 30);
@@ -654,9 +668,41 @@ bool runConfigPortal(bool forcePortal) {
   wm.addParameter(&custom_baseurl);
 
   wm.setParamsPage(true); // keep the backend fields off the Wi-Fi page, on their own page instead
-  wm.setCustomMenuHTML("<form action='/param' method='get'><button>Configure Backend</button></form><br/>\n");
+  wm.setCustomMenuHTML(
+    "<form action='/param' method='get'><button>Configure Backend</button></form><br/>\n"
+    "<form action='/resetdevice' method='get'><button>Reset Device</button></form><br/>\n"
+  );
   std::vector<const char *> menu = {"wifi", "custom", "info", "exit"};
-  wm.setMenu(menu); // adds our "Configure Backend" button next to the native "Configure WiFi" one
+  wm.setMenu(menu); // adds our "Configure Backend"/"Reset Device" buttons next to the native "Configure WiFi" one
+
+  // Registers a custom /resetdevice page on WiFiManager's own web server --
+  // fires once the server exists but before WiFiManager's own routes are
+  // attached, per its documented setWebServerCallback() contract, so this
+  // only ADDS a route rather than needing to override anything. Deliberately
+  // NOT reachable from the on-device menu -- see resetAllFingerprints().
+  // GET shows a warning + confirm button; only the POST actually wipes the
+  // sensor, so a stray click/prefetch of the link itself can't trigger it.
+  wm.setWebServerCallback([&wm]() {
+    wm.server->on("/resetdevice", HTTP_GET, [&wm]() {
+      wm.server->send(200, "text/html",
+        "<html><body>"
+        "<h2 style='color:#c00'>Reset Device</h2>"
+        "<p>This deletes <b>ALL</b> fingerprints stored on this device. "
+        "Every enrolled employee will need to be re-enrolled. This cannot be undone.</p>"
+        "<form action='/resetdevice' method='POST'>"
+        "<button type='submit' style='background:#c00;color:#fff;padding:10px'>Yes, delete everything</button>"
+        "</form>"
+        "<p><a href='/'>Cancel</a></p>"
+        "</body></html>");
+    });
+    wm.server->on("/resetdevice", HTTP_POST, [&wm]() {
+      bool ok = resetAllFingerprints();
+      wm.server->send(200, "text/html",
+        ok
+          ? "<html><body><h2>Reset complete</h2><p>All fingerprints deleted.</p><p><a href='/'>Back</a></p></body></html>"
+          : "<html><body><h2 style='color:#c00'>Reset failed</h2><p>Could not reach the fingerprint sensor. Check wiring and try again.</p><p><a href='/'>Back</a></p></body></html>");
+    });
+  });
 
   shouldSaveConfig = false;
   bool connected;
@@ -673,7 +719,7 @@ bool runConfigPortal(bool forcePortal) {
     // as promptOTAConfirmation()) lets a short press cancel straight back
     // to the menu instead of waiting out the full 180s timeout.
     wm.setConfigPortalBlocking(false);
-    wm.startConfigPortal("Device-Setup");
+    wm.startConfigPortal("Device-Setup", DEVICE_SETUP_AP_PASSWORD);
     while (wm.getConfigPortalActive()) {
       wm.process();
 
@@ -691,7 +737,7 @@ bool runConfigPortal(bool forcePortal) {
     }
     connected = (WiFi.status() == WL_CONNECTED);
   } else {
-    connected = wm.autoConnect("Device-Setup");
+    connected = wm.autoConnect("Device-Setup", DEVICE_SETUP_AP_PASSWORD);
   }
   configPortalCancellable = false;
 
@@ -1695,6 +1741,38 @@ void doEnroll() {
   if (posted) beepSuccess(); else beepError();
   delay(1200);
   setAuraIdle();
+}
+
+/* Wipes every fingerprint template on the sensor via the FPM library's
+   emptyDatabase() (maps to the R503's PS_Empty command). Deliberately NOT
+   reachable from the on-device menu -- deleting every employee's
+   fingerprint is irreversible and affects everyone who uses this device,
+   so it needs to require the same access as changing Wi-Fi/backend config
+   (the "Device-Setup" AP's password), not be reachable by anyone who just
+   picks up the unit and scrolls the menu. Triggered from the WiFiManager
+   portal's /resetdevice page instead (see runConfigPortal()), which is
+   itself gated behind DEVICE_SETUP_AP_PASSWORD and its own web-side
+   confirmation step. Deleting all templates also frees slot 0 again, which
+   findFreeTemplateId()/reserveSlotZero() already handle automatically on
+   the next enrollment -- no special-casing needed here. */
+bool resetAllFingerprints() {
+  if (!sensorReady && !initFingerprintSensor()) return false;
+
+  showStatus(STATUS_WIFI, "Reset", "Deleting...");
+  FPMStatus st = finger.emptyDatabase();
+
+  if (st == FPMStatus::OK) {
+    setAuraSuccess();
+    showStatus(STATUS_OK, "Reset", "Complete");
+    beepSuccess();
+  } else {
+    setAuraError();
+    showStatus(STATUS_ERROR, "Reset", "Failed");
+    beepError();
+  }
+  delay(1200);
+  setAuraIdle();
+  return st == FPMStatus::OK;
 }
 
 bool doLogin() {
