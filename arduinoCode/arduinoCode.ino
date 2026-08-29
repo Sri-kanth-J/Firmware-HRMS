@@ -101,9 +101,9 @@ WiFiClientSecure secureClient;
    is single-threaded, a sync in flight delays processing of a finger-touch
    that lands mid-request -- i.e. it can make a person standing at the
    device wait. So instead of syncing on a flat interval regardless of
-   activity, background sync only fires once PUNCH_SYNC_IDLE_MS has passed
-   since the last punch (see appendPunch()/loop()) -- it never even gets
-   scheduled during a busy stretch, only once things go quiet. */
+   activity, background sync only fires once punchSyncIdleMinutes has
+   passed since the last punch (see appendPunch()/loop()) -- it never even
+   gets scheduled during a busy stretch, only once things go quiet. */
 struct PunchRecord {
   uint16_t slotId;
   uint32_t epochTime; // true UTC seconds since epoch -- see getUtcEpochNow()
@@ -111,7 +111,17 @@ struct PunchRecord {
 std::vector<PunchRecord> punchBuffer;
 unsigned long lastPunchActivityMs = 0; // bumped on every appendPunch() -- gates the idle-sync trigger
 
-#define PUNCH_SYNC_IDLE_MS (5UL * 60UL * 1000UL) // background sync only fires after this long with no new punch
+// Background sync only fires after this many idle minutes with no new punch
+// (see loop()). Runtime-configurable from the "Configure Backend" AP portal
+// page (see runConfigPortal()) rather than a fixed constant, persisted to
+// NVS alongside the other backend fields (see loadConfig()/saveConfig()) --
+// factory default/valid range below, actual value lives in
+// punchSyncIdleMinutes.
+#define PUNCH_SYNC_IDLE_DEFAULT_MIN 5
+#define PUNCH_SYNC_IDLE_MIN_MIN     1
+#define PUNCH_SYNC_IDLE_MAX_MIN     60
+uint16_t punchSyncIdleMinutes = PUNCH_SYNC_IDLE_DEFAULT_MIN;
+
 #define PUNCH_SYNC_BATCH_SIZE 30 // punches per POST -- keeps the JSON payload bounded regardless of how large the buffer has grown
 #define PUNCH_BUFFER_HARD_CAP 300 // safety valve for a sustained outage (see appendPunch()) -- ~10 batches, well within RAM/NVS
 
@@ -122,7 +132,7 @@ unsigned long lastPunchActivityMs = 0; // bumped on every appendPunch() -- gates
 #define PUNCH_SYNC_HTTP_RESPONSE_TIMEOUT_MS 5000
 
 // How often loop() re-checks registration/punch-idle/enroll-list-refresh --
-// NOT how often a punch sync actually happens (see PUNCH_SYNC_IDLE_MS above).
+// NOT how often a punch sync actually happens (see punchSyncIdleMinutes above).
 #define BACKGROUND_TASK_INTERVAL_MS 20000
 unsigned long lastBackgroundTaskMs = 0;
 
@@ -592,6 +602,10 @@ void loadConfig() {
   keySecret = prefs.getString("keysecret", DEFAULT_KEY_SECRET);
   baseUrl = prefs.getString("baseurl", DEFAULT_BASE_URL);
   tenantSlug = prefs.getString("tenant", DEFAULT_TENANT_SLUG);
+  punchSyncIdleMinutes = prefs.getUShort("syncidlemin", PUNCH_SYNC_IDLE_DEFAULT_MIN);
+  if (punchSyncIdleMinutes < PUNCH_SYNC_IDLE_MIN_MIN || punchSyncIdleMinutes > PUNCH_SYNC_IDLE_MAX_MIN) {
+    punchSyncIdleMinutes = PUNCH_SYNC_IDLE_DEFAULT_MIN; // guard against corrupt/pre-upgrade NVS data
+  }
   deviceRegistered = prefs.getBool("registered", false);
   uint16_t storedCount = prefs.getUShort("punchcnt", 0);
   if (storedCount > 0) {
@@ -607,6 +621,7 @@ void saveConfig() {
   prefs.putString("keysecret", keySecret);
   prefs.putString("baseurl", baseUrl);
   prefs.putString("tenant", tenantSlug);
+  prefs.putUShort("syncidlemin", punchSyncIdleMinutes);
   prefs.end();
   Serial.println("[CONFIG] Saved device config to NVS");
 }
@@ -698,10 +713,14 @@ bool runConfigPortal(bool forcePortal) {
   WiFiManagerParameter custom_keysecret("keysecret", "Device Key Secret", keySecret.c_str(), 64);
   WiFiManagerParameter custom_baseurl("baseurl", "Backend Base URL (include /api)", baseUrl.c_str(), 80);
   WiFiManagerParameter custom_tenant("tenant", "Backend Tenant Slug", tenantSlug.c_str(), 40);
+  char syncIdleBuf[4];
+  snprintf(syncIdleBuf, sizeof(syncIdleBuf), "%u", punchSyncIdleMinutes);
+  WiFiManagerParameter custom_syncidle("syncidlemin", "Punch Sync Idle Minutes (1-60)", syncIdleBuf, 3);
   wm.addParameter(&custom_deviceid);
   wm.addParameter(&custom_keysecret);
   wm.addParameter(&custom_baseurl);
   wm.addParameter(&custom_tenant);
+  wm.addParameter(&custom_syncidle);
 
   wm.setParamsPage(true); // keep the backend fields off the Wi-Fi page, on their own page instead
   wm.setCustomMenuHTML(
@@ -829,6 +848,13 @@ bool runConfigPortal(bool forcePortal) {
     keySecret = String(custom_keysecret.getValue());
     baseUrl = String(custom_baseurl.getValue());
     tenantSlug = String(custom_tenant.getValue());
+
+    long parsedIdleMin = String(custom_syncidle.getValue()).toInt();
+    if (parsedIdleMin < PUNCH_SYNC_IDLE_MIN_MIN || parsedIdleMin > PUNCH_SYNC_IDLE_MAX_MIN) {
+      parsedIdleMin = PUNCH_SYNC_IDLE_DEFAULT_MIN; // invalid/out-of-range input -- fall back rather than save garbage
+    }
+    punchSyncIdleMinutes = (uint16_t)parsedIdleMin;
+
     saveConfig();
   }
 
@@ -1543,7 +1569,7 @@ bool syncPunchBufferBatch() {
 }
 
 /* Drains the whole buffer, one PUNCH_SYNC_BATCH_SIZE batch per call. Called
-   from loop() only once the device has been idle for PUNCH_SYNC_IDLE_MS
+   from loop() only once the device has been idle for punchSyncIdleMinutes
    (see appendPunch()) -- never while someone might be mid-punch. Stops at
    the first failed batch; whatever's left stays buffered for the next idle
    window. */
@@ -2149,19 +2175,24 @@ void loop() {
   // TFT (to update the "Enrolls (N)" badge if the menu happens to be open) --
   // registration/punch-sync never touch the screen; the only screen touch
   // outside this block is appendPunch()'s "Buffer Full" message. Punch sync
-  // itself only runs once idle for PUNCH_SYNC_IDLE_MS (see appendPunch()'s
-  // comment) -- this tick just checks whether that idle window has been
-  // reached, it doesn't gate the sync on its own.
+  // itself only runs once idle for punchSyncIdleMinutes (see appendPunch()'s
+  // comment, and runConfigPortal() for where that's configured) -- this
+  // tick just checks whether that idle window has been reached. An empty
+  // buffer is handled first and separately so an idle device with nothing
+  // to sync falls straight through to the enroll-list refresh instead of
+  // evaluating (and failing) the idle-time check every tick.
   if (millis() - lastBackgroundTaskMs > BACKGROUND_TASK_INTERVAL_MS) {
     lastBackgroundTaskMs = millis();
     if (WiFi.status() == WL_CONNECTED) {
       if (!deviceRegistered) {
         registerDeviceIfNeeded();
-      } else if (!punchBuffer.empty() && millis() - lastPunchActivityMs >= PUNCH_SYNC_IDLE_MS) {
+      } else if (punchBuffer.empty()) {
+        if (millis() - lastEnrollListRefreshMs > ENROLL_LIST_REFRESH_INTERVAL_MS) {
+          lastEnrollListRefreshMs = millis();
+          if (fetchEmployeesWithoutEnrollment() && appState == STATE_MENU) drawMenu();
+        }
+      } else if (millis() - lastPunchActivityMs >= (unsigned long)punchSyncIdleMinutes * 60000UL) {
         syncPunchBuffer();
-      } else if (millis() - lastEnrollListRefreshMs > ENROLL_LIST_REFRESH_INTERVAL_MS) {
-        lastEnrollListRefreshMs = millis();
-        if (fetchEmployeesWithoutEnrollment() && appState == STATE_MENU) drawMenu();
       }
     }
   }
