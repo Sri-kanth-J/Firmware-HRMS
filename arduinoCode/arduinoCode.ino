@@ -691,15 +691,17 @@ bool runConfigPortal(bool forcePortal) {
   // attached, per its documented setWebServerCallback() contract, so this
   // only ADDS a route rather than needing to override anything. Deliberately
   // NOT reachable from the on-device menu -- see resetAllFingerprints().
-  // GET shows a warning + confirm button; only the POST actually wipes the
-  // sensor, so a stray click/prefetch of the link itself can't trigger it.
+  // GET shows a warning + confirm button; only the POST actually resets the
+  // device, so a stray click/prefetch of the link itself can't trigger it.
   wm.setWebServerCallback([&wm]() {
     wm.server->on("/resetdevice", HTTP_GET, [&wm]() {
       wm.server->send(200, "text/html",
         "<html><body>"
         "<h2 style='color:#c00'>Reset Device</h2>"
-        "<p>This deletes <b>ALL</b> fingerprints stored on this device. "
-        "Every enrolled employee will need to be re-enrolled. This cannot be undone.</p>"
+        "<p>This deletes <b>ALL</b> fingerprints stored on this device, and "
+        "clears any punch records buffered here that haven't synced to the "
+        "backend yet. Every enrolled employee will need to be re-enrolled. "
+        "This cannot be undone.</p>"
         "<form action='/resetdevice' method='POST'>"
         "<button type='submit' style='background:#c00;color:#fff;padding:10px'>Yes, delete everything</button>"
         "</form>"
@@ -710,7 +712,7 @@ bool runConfigPortal(bool forcePortal) {
       bool ok = resetAllFingerprints();
       wm.server->send(200, "text/html",
         ok
-          ? "<html><body><h2>Reset complete</h2><p>All fingerprints deleted. The device is restarting.</p></body></html>"
+          ? "<html><body><h2>Reset complete</h2><p>All fingerprints and buffered punches deleted. The device is restarting.</p></body></html>"
           : "<html><body><h2 style='color:#c00'>Reset failed</h2><p>Could not reach the fingerprint sensor. Check wiring and try again.</p><p><a href='/'>Back</a></p></body></html>");
       // Restart on success so the device comes back up in a clean state
       // rather than sitting in this AP/portal session indefinitely -- send()
@@ -1420,6 +1422,23 @@ bool registerDeviceIfNeeded() {
   return true;
 }
 
+/* Clears the buffered {slotId, timestamp} punch records waiting to sync --
+   NOT the fingerprint templates themselves (those live on the R503 sensor;
+   see resetAllFingerprints(), which calls this as part of a merged "Reset
+   Device" action). This is the NVS data that got "poisoned" by a bad
+   slotId=0 entry earlier and needed a manual esptool erase to clear.
+   Deliberately scoped to ONLY the punch buffer: WiFi credentials, backend
+   config (deviceId/keySecret/baseUrl/tenantSlug), and the registration flag
+   are all untouched. */
+void clearPunchBuffer() {
+  punchBufferCount = 0;
+  for (uint8_t i = 0; i < PUNCH_BUFFER_CAPACITY; i++) {
+    punchBuffer[i].slotId = 0;
+    punchBuffer[i].epochTime = 0;
+  }
+  savePunchBuffer();
+}
+
 /* Flushes the punch buffer in one all-or-nothing bulk POST -- the backend
    gives no per-entry ack, so success clears the whole buffer and any
    failure leaves it fully intact for the next attempt. */
@@ -1766,16 +1785,21 @@ void doEnroll() {
   setAuraIdle();
 }
 
-/* Wipes every fingerprint template on the sensor via the FPM library's
-   emptyDatabase() (maps to the R503's PS_Empty command). Deliberately NOT
-   reachable from the on-device menu -- deleting every employee's
-   fingerprint is irreversible and affects everyone who uses this device,
-   so it needs to require the same access as changing Wi-Fi/backend config
-   (the "Device-Setup" AP's password), not be reachable by anyone who just
-   picks up the unit and scrolls the menu. Triggered from the WiFiManager
-   portal's /resetdevice page instead (see runConfigPortal()), which is
-   itself gated behind DEVICE_SETUP_AP_PASSWORD and its own web-side
-   confirmation step. Deleting all templates also frees slot 0 again, which
+/* Full device reset: wipes every fingerprint template on the sensor via the
+   FPM library's emptyDatabase() (maps to the R503's PS_Empty command), AND
+   clears any buffered punch records waiting to sync (see
+   clearPunchBuffer()) -- one merged action, not two separate ones.
+   All-or-nothing: the punch buffer is only cleared if the sensor wipe
+   actually succeeds, so a failure (e.g. sensor missing) doesn't silently
+   discard punch history that hasn't synced yet. Deliberately NOT reachable
+   from the on-device menu -- deleting every employee's fingerprint is
+   irreversible and affects everyone who uses this device, so it needs to
+   require the same access as changing Wi-Fi/backend config (the
+   "Device-Setup" AP's password), not be reachable by anyone who just picks
+   up the unit and scrolls the menu. Triggered from the WiFiManager portal's
+   /resetdevice page instead (see runConfigPortal()), which is itself gated
+   behind DEVICE_SETUP_AP_PASSWORD and its own web-side confirmation step.
+   Deleting all templates also frees slot 0 again, which
    findFreeTemplateId()/reserveSlotZero() already handle automatically on
    the next enrollment -- no special-casing needed here. */
 bool resetAllFingerprints() {
@@ -1785,6 +1809,7 @@ bool resetAllFingerprints() {
   FPMStatus st = finger.emptyDatabase();
 
   if (st == FPMStatus::OK) {
+    clearPunchBuffer();
     setAuraSuccess();
     showStatus(STATUS_OK, "Reset", "Complete");
     beepSuccess();
